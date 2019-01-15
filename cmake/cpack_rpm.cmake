@@ -99,12 +99,15 @@ SET(ignored
   "%ignore /etc"
   "%ignore /etc/init.d"
   "%ignore /etc/logrotate.d"
+  "%ignore /etc/systemd"
+  "%ignore /etc/systemd/system"
   "%ignore ${CMAKE_INSTALL_PREFIX}"
   "%ignore ${CMAKE_INSTALL_PREFIX}/bin"
   "%ignore ${CMAKE_INSTALL_PREFIX}/include"
   "%ignore ${CMAKE_INSTALL_PREFIX}/lib"
   "%ignore ${CMAKE_INSTALL_PREFIX}/lib/systemd"
   "%ignore ${CMAKE_INSTALL_PREFIX}/lib/systemd/system"
+  "%ignore ${CMAKE_INSTALL_PREFIX}/lib/tmpfiles.d"
   "%ignore ${CMAKE_INSTALL_PREFIX}/lib64"
   "%ignore ${CMAKE_INSTALL_PREFIX}/sbin"
   "%ignore ${CMAKE_INSTALL_PREFIX}/share"
@@ -211,6 +214,8 @@ ELSEIF(RPM MATCHES "fedora" OR RPM MATCHES "(rhel|centos)7")
   ALTERNATIVE_NAME("server" "mariadb-server")
   ALTERNATIVE_NAME("server" "mysql-compat-server")
   ALTERNATIVE_NAME("test"   "mariadb-test")
+ELSEIF(RPM MATCHES "(rhel|centos)8")
+  SET(PYTHON_SHEBANG "/usr/bin/python3")
 ENDIF()
 
 # workaround for lots of perl dependencies added by rpmbuild

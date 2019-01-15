@@ -53,7 +53,6 @@
 #include "rpl_constants.h"
 #include "sql_digest.h"
 #include "zlib.h"
-#include "my_atomic.h"
 
 #define my_b_write_string(A, B) my_b_write((A), (uchar*)(B), (uint) (sizeof(B) - 1))
 
@@ -101,16 +100,11 @@ TYPELIB binlog_checksum_typelib=
    TODO: correct the constant when it has been determined 
    (which main tree to push and when) 
 */
-const uchar checksum_version_split_mysql[3]= {5, 6, 1};
-const ulong checksum_version_product_mysql=
-  (checksum_version_split_mysql[0] * 256 +
-   checksum_version_split_mysql[1]) * 256 +
-  checksum_version_split_mysql[2];
-const uchar checksum_version_split_mariadb[3]= {5, 3, 0};
-const ulong checksum_version_product_mariadb=
-  (checksum_version_split_mariadb[0] * 256 +
-   checksum_version_split_mariadb[1]) * 256 +
-  checksum_version_split_mariadb[2];
+const Version checksum_version_split_mysql(5, 6, 1);
+const Version checksum_version_split_mariadb(5, 3, 0);
+
+// First MySQL version with fraction seconds
+const Version fsp_version_split_mysql(5, 6, 0);
 
 #if !defined(MYSQL_CLIENT) && defined(HAVE_REPLICATION)
 static int rows_event_stmt_cleanup(rpl_group_info *rgi, THD* thd);
@@ -264,6 +258,27 @@ static void inline slave_rows_error_report(enum loglevel level, int ha_error,
 }
 #endif
 
+#if defined(HAVE_REPLICATION) && !defined(MYSQL_CLIENT)
+static void set_thd_db(THD *thd, Rpl_filter *rpl_filter,
+                       const char *db, uint32 db_len)
+{
+  char lcase_db_buf[NAME_LEN +1];
+  LEX_CSTRING new_db;
+  new_db.length= db_len;
+  if (lower_case_table_names == 1)
+  {
+    strmov(lcase_db_buf, db);
+    my_casedn_str(system_charset_info, lcase_db_buf);
+    new_db.str= lcase_db_buf;
+  }
+  else
+    new_db.str= db;
+  /* TODO WARNING this makes rewrite_db respect lower_case_table_names values
+   * for more info look MDEV-17446 */
+  new_db.str= rpl_filter->get_rewrite_db(new_db.str, &new_db.length);
+  thd->set_db(&new_db);
+}
+#endif
 /*
   Cache that will automatically be written to a dedicated file on
   destruction.
@@ -4520,6 +4535,7 @@ code_name(int code)
 }
 #endif
 
+
 /**
    Macro to check that there is enough space to read from memory.
 
@@ -4742,6 +4758,30 @@ Query_log_event::Query_log_event(const char* buf, uint event_len,
       pos= (const uchar*) end;                         // Break loop
     }
   }
+
+#if !defined(MYSQL_CLIENT)
+  if (description_event->server_version_split.kind ==
+      Format_description_log_event::master_version_split::KIND_MYSQL)
+  {
+    // Handle MariaDB/MySQL incompatible sql_mode bits
+    sql_mode_t mysql_sql_mode= sql_mode;
+    sql_mode&= MODE_MASK_MYSQL_COMPATIBLE; // Unset MySQL specific bits
+
+    /*
+      sql_mode flags related to fraction second rounding/truncation
+      have opposite meaning in MySQL vs MariaDB.
+      MySQL:
+       - rounds fractional seconds by default
+       - truncates if TIME_TRUNCATE_FRACTIONAL is set
+      MariaDB:
+       - truncates fractional seconds by default
+       - rounds if TIME_ROUND_FRACTIONAL is set
+    */
+    if (description_event->server_version_split >= fsp_version_split_mysql &&
+       !(mysql_sql_mode & MODE_MYSQL80_TIME_TRUNCATE_FRACTIONAL))
+      sql_mode|= MODE_TIME_ROUND_FRACTIONAL;
+  }
+#endif
 
   /**
     Layout for the data buffer is as follows
@@ -5374,7 +5414,6 @@ bool test_if_equal_repl_errors(int expected_error, int actual_error)
 int Query_log_event::do_apply_event(rpl_group_info *rgi,
                                     const char *query_arg, uint32 q_len_arg)
 {
-  LEX_CSTRING new_db;
   int expected_error,actual_error= 0;
   Schema_specification_st db_options;
   uint64 sub_id= 0;
@@ -5406,9 +5445,7 @@ int Query_log_event::do_apply_event(rpl_group_info *rgi,
     goto end;
   }
 
-  new_db.length= db_len;
-  new_db.str= (char *) rpl_filter->get_rewrite_db(db, &new_db.length);
-  thd->set_db(&new_db);                 /* allocates a copy of 'db' */
+  set_thd_db(thd, rpl_filter, db, db_len);
 
   /*
     Setting the character set and collation of the current database thd->db.
@@ -5563,7 +5600,7 @@ int Query_log_event::do_apply_event(rpl_group_info *rgi,
           gtid= rgi->current_gtid;
           if (unlikely(rpl_global_gtid_slave_state->record_gtid(thd, &gtid,
                                                                 sub_id,
-                                                                rgi, false,
+                                                                true, false,
                                                                 &hton)))
           {
             int errcode= thd->get_stmt_da()->sql_errno();
@@ -6531,26 +6568,24 @@ bool Format_description_log_event::start_decryption(Start_encryption_log_event* 
   return crypto_data.init(sele->crypto_scheme, sele->key_version);
 }
 
-static inline void
-do_server_version_split(char* version,
-                        Format_description_log_event::master_version_split *split_versions)
+
+Version::Version(const char *version, const char **endptr)
 {
-  char *p= version, *r;
+  const char *p= version;
   ulong number;
   for (uint i= 0; i<=2; i++)
   {
+    char *r;
     number= strtoul(p, &r, 10);
     /*
       It is an invalid version if any version number greater than 255 or
       first number is not followed by '.'.
     */
     if (number < 256 && (*r == '.' || i != 0))
-      split_versions->ver[i]= (uchar) number;
+      m_ver[i]= (uchar) number;
     else
     {
-      split_versions->ver[0]= 0;
-      split_versions->ver[1]= 0;
-      split_versions->ver[2]= 0;
+      *this= Version();
       break;
     }
 
@@ -6558,12 +6593,19 @@ do_server_version_split(char* version,
     if (*r == '.')
       p++; // skip the dot
   }
+  endptr[0]= p;
+}
+
+
+Format_description_log_event::
+  master_version_split::master_version_split(const char *version)
+{
+  const char *p;
+  static_cast<Version*>(this)[0]= Version(version, &p);
   if (strstr(p, "MariaDB") != 0 || strstr(p, "-maria-") != 0)
-    split_versions->kind=
-      Format_description_log_event::master_version_split::KIND_MARIADB;
+    kind= KIND_MARIADB;
   else
-    split_versions->kind=
-      Format_description_log_event::master_version_split::KIND_MYSQL;
+    kind= KIND_MYSQL;
 }
 
 
@@ -6577,20 +6619,14 @@ do_server_version_split(char* version,
 */
 void Format_description_log_event::calc_server_version_split()
 {
-  do_server_version_split(server_version, &server_version_split);
+  server_version_split= master_version_split(server_version);
 
   DBUG_PRINT("info",("Format_description_log_event::server_version_split:"
                      " '%s' %d %d %d", server_version,
-                     server_version_split.ver[0],
-                     server_version_split.ver[1], server_version_split.ver[2]));
+                     server_version_split[0],
+                     server_version_split[1], server_version_split[2]));
 }
 
-static inline ulong
-version_product(const Format_description_log_event::master_version_split* version_split)
-{
-  return ((version_split->ver[0] * 256 + version_split->ver[1]) * 256
-          + version_split->ver[2]);
-}
 
 /**
    @return TRUE is the event's version is earlier than one that introduced
@@ -6600,9 +6636,9 @@ bool
 Format_description_log_event::is_version_before_checksum(const master_version_split
                                                          *version_split)
 {
-  return version_product(version_split) <
+  return *version_split <
     (version_split->kind == master_version_split::KIND_MARIADB ?
-     checksum_version_product_mariadb : checksum_version_product_mysql);
+     checksum_version_split_mariadb : checksum_version_split_mysql);
 }
 
 /**
@@ -6618,7 +6654,6 @@ enum enum_binlog_checksum_alg get_checksum_alg(const char* buf, ulong len)
 {
   enum enum_binlog_checksum_alg ret;
   char version[ST_SERVER_VER_LEN];
-  Format_description_log_event::master_version_split version_split;
 
   DBUG_ENTER("get_checksum_alg");
   DBUG_ASSERT(buf[EVENT_TYPE_OFFSET] == FORMAT_DESCRIPTION_EVENT);
@@ -6628,7 +6663,7 @@ enum enum_binlog_checksum_alg get_checksum_alg(const char* buf, ulong len)
          ST_SERVER_VER_LEN);
   version[ST_SERVER_VER_LEN - 1]= 0;
   
-  do_server_version_split(version, &version_split);
+  Format_description_log_event::master_version_split version_split(version);
   ret= Format_description_log_event::is_version_before_checksum(&version_split)
     ? BINLOG_CHECKSUM_ALG_UNDEF
     : (enum_binlog_checksum_alg)buf[len - BINLOG_CHECKSUM_LEN - BINLOG_CHECKSUM_ALG_DESC_LEN];
@@ -7238,15 +7273,12 @@ void Load_log_event::set_fields(const char* affected_db,
 int Load_log_event::do_apply_event(NET* net, rpl_group_info *rgi,
                                    bool use_rli_only_for_errors)
 {
-  LEX_CSTRING new_db;
   Relay_log_info const *rli= rgi->rli;
   Rpl_filter *rpl_filter= rli->mi->rpl_filter;
   DBUG_ENTER("Load_log_event::do_apply_event");
 
-  new_db.length= db_len;
-  new_db.str= rpl_filter->get_rewrite_db(db, &new_db.length);
-  thd->set_db(&new_db);
   DBUG_ASSERT(thd->query() == 0);
+  set_thd_db(thd, rpl_filter, db, db_len);
   thd->clear_error(1);
 
   /* see Query_log_event::do_apply_event() and BUG#13360 */
@@ -7290,6 +7322,8 @@ int Load_log_event::do_apply_event(NET* net, rpl_group_info *rgi,
 
     TABLE_LIST tables;
     LEX_CSTRING db_name= { thd->strmake(thd->db.str, thd->db.length), thd->db.length };
+    if (lower_case_table_names)
+      my_casedn_str(system_charset_info, (char *)table_name);
     LEX_CSTRING tbl_name=   { table_name, strlen(table_name) };
     tables.init_one_table(&db_name, &tbl_name, 0, TL_WRITE);
     tables.updating= 1;
@@ -8020,16 +8054,13 @@ Gtid_log_event::do_apply_event(rpl_group_info *rgi)
   switch (flags2 & (FL_DDL | FL_TRANSACTIONAL))
   {
     case FL_TRANSACTIONAL:
-      my_atomic_add64_explicit((volatile int64 *)&mi->total_trans_groups, 1,
-                 MY_MEMORY_ORDER_RELAXED);
+      mi->total_trans_groups++;
       break;
     case FL_DDL:
-      my_atomic_add64_explicit((volatile int64 *)&mi->total_ddl_groups, 1,
-                 MY_MEMORY_ORDER_RELAXED);
+      mi->total_ddl_groups++;
     break;
     default:
-      my_atomic_add64_explicit((volatile int64 *)&mi->total_non_trans_groups, 1,
-                 MY_MEMORY_ORDER_RELAXED);
+      mi->total_non_trans_groups++;
   }
 
   if (flags2 & FL_STANDALONE)
@@ -8361,7 +8392,7 @@ Gtid_list_log_event::do_apply_event(rpl_group_info *rgi)
     {
       if ((ret= rpl_global_gtid_slave_state->record_gtid(thd, &list[i],
                                                          sub_id_list[i],
-                                                         NULL, false, &hton)))
+                                                         false, false, &hton)))
         return ret;
       rpl_global_gtid_slave_state->update_state_hash(sub_id_list[i], &list[i],
                                                      hton, NULL);
@@ -8898,7 +8929,7 @@ int Xid_log_event::do_apply_event(rpl_group_info *rgi)
     rgi->gtid_pending= false;
 
     gtid= rgi->current_gtid;
-    err= rpl_global_gtid_slave_state->record_gtid(thd, &gtid, sub_id, rgi,
+    err= rpl_global_gtid_slave_state->record_gtid(thd, &gtid, sub_id, true,
                                                   false, &hton);
     if (unlikely(err))
     {
@@ -12573,7 +12604,7 @@ check_table_map(rpl_group_info *rgi, RPL_TABLE_LIST *table_list)
 int Table_map_log_event::do_apply_event(rpl_group_info *rgi)
 {
   RPL_TABLE_LIST *table_list;
-  char *db_mem, *tname_mem;
+  char *db_mem, *tname_mem, *ptr;
   size_t dummy_len, db_mem_length, tname_mem_length;
   void *memory;
   Rpl_filter *filter;
@@ -12590,10 +12621,20 @@ int Table_map_log_event::do_apply_event(rpl_group_info *rgi)
                                 NullS)))
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
 
+  db_mem_length= strmov(db_mem, m_dbnam) - db_mem;
+  tname_mem_length= strmov(tname_mem, m_tblnam) - tname_mem;
+  if (lower_case_table_names)
+  {
+    my_casedn_str(files_charset_info, (char*)tname_mem);
+    my_casedn_str(files_charset_info, (char*)db_mem);
+  }
+
   /* call from mysql_client_binlog_statement() will not set rli->mi */
   filter= rgi->thd->slave_thread ? rli->mi->rpl_filter : global_rpl_filter;
-  db_mem_length= strmov(db_mem, filter->get_rewrite_db(m_dbnam, &dummy_len))- db_mem;
-  tname_mem_length= strmov(tname_mem, m_tblnam)- tname_mem;
+
+  /* rewrite rules changed the database */
+  if (((ptr= (char*) filter->get_rewrite_db(db_mem, &dummy_len)) != db_mem))
+    db_mem_length= strmov(db_mem, ptr) - db_mem;
 
   LEX_CSTRING tmp_db_name=  {db_mem, db_mem_length };
   LEX_CSTRING tmp_tbl_name= {tname_mem, tname_mem_length };

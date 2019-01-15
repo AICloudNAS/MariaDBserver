@@ -853,7 +853,7 @@ static bool fix_fields_part_func(THD *thd, Item* func_expr, TABLE *table,
     const bool save_agg_field= thd->lex->current_select->non_agg_field_used();
     const bool save_agg_func=  thd->lex->current_select->agg_func_used();
     const nesting_map saved_allow_sum_func= thd->lex->allow_sum_func;
-    thd->lex->allow_sum_func= 0;
+    thd->lex->allow_sum_func.clear_all();
 
     if (likely(!(error= func_expr->fix_fields_if_needed(thd, (Item**)&func_expr))))
       func_expr->walk(&Item::post_fix_fields_part_expr_processor, 0, NULL);
@@ -8217,6 +8217,7 @@ static int get_part_iter_for_interval_via_mapping(partition_info *part_info,
              field->type() == MYSQL_TYPE_DATETIME))
         {
           /* Monotonic, but return NULL for dates with zeros in month/day. */
+          DBUG_ASSERT(field->cmp_type() == TIME_RESULT); // No rounding/truncation
           zero_in_start_date= field->get_date(&start_date, date_mode_t(0));
           DBUG_PRINT("info", ("zero start %u %04d-%02d-%02d",
                               zero_in_start_date, start_date.year,
@@ -8241,6 +8242,7 @@ static int get_part_iter_for_interval_via_mapping(partition_info *part_info,
         !part_info->part_expr->null_value)
     {
       MYSQL_TIME end_date;
+      DBUG_ASSERT(field->cmp_type() == TIME_RESULT); // No rounding/truncation
       bool zero_in_end_date= field->get_date(&end_date, date_mode_t(0));
       /*
         This is an optimization for TO_DAYS()/TO_SECONDS() to avoid scanning

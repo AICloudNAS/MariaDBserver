@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2018, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -23,8 +23,6 @@ General row routines
 
 Created 4/20/1996 Heikki Tuuri
 *******************************************************/
-
-#include "ha_prototypes.h"
 
 #include "row0row.h"
 #include "data0type.h"
@@ -312,7 +310,7 @@ row_build_index_entry_low(
 		indexed long columns may be stored off-page. */
 		ut_ad(f.col->ord_part);
 
-		if (ext) {
+		if (ext && !f.col->is_virtual()) {
 			/* See if the column is stored externally. */
 			const byte*	buf = row_ext_lookup(ext, f.col->ind,
 							     &len);
@@ -727,6 +725,7 @@ row_rec_to_index_entry_impl(
 	ut_ad(heap != NULL);
 	ut_ad(index != NULL);
 	ut_ad(!mblob || index->is_primary());
+	ut_ad(!mblob || !index->table->is_temporary());
 	ut_ad(!mblob || !dict_index_is_spatial(index));
 	compile_time_assert(!mblob || metadata);
 	compile_time_assert(mblob <= 2);
@@ -761,7 +760,8 @@ row_rec_to_index_entry_impl(
 	      || rec_len == dict_index_get_n_fields(index) + uint(mblob == 1)
 	      /* a record for older SYS_INDEXES table
 	      (missing merge_threshold column) is acceptable. */
-	      || (index->table->id == DICT_INDEXES_ID
+	      || (!index->table->is_temporary()
+		  && index->table->id == DICT_INDEXES_ID
 		  && rec_len == dict_index_get_n_fields(index) - 1));
 
 	ulint i;

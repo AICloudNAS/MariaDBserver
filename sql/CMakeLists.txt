@@ -136,7 +136,7 @@ SET (SQL_SOURCE
                opt_split.cc
 	       ${WSREP_SOURCES}
                table_cache.cc encryption.cc temporary_tables.cc
-               proxy_protocol.cc
+               proxy_protocol.cc backup.cc
                ${CMAKE_CURRENT_BINARY_DIR}/sql_builtin.cc
                ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc
                ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc_ora.cc
@@ -318,7 +318,7 @@ DTRACE_INSTRUMENT_STATIC_LIBS(mysqld
 SET(WITH_MYSQLD_LDFLAGS "" CACHE STRING "Additional linker flags for mysqld")
 MARK_AS_ADVANCED(WITH_MYSQLD_LDFLAGS)
 IF(WITH_MYSQLD_LDFLAGS)
-  GET_TARGET_PROPERTY(mysqld LINK_FLAGS MYSQLD_LINK_FLAGS)
+  GET_TARGET_PROPERTY(MYSQLD_LINK_FLAGS mysqld LINK_FLAGS)
   IF(NOT MYSQLD_LINK_FLAGS)
     SET(MYSQLD_LINK_FLAGS) 
   ENDIF() 
@@ -486,13 +486,15 @@ IF(WIN32)
     COMPONENT Server
   )
   SET_TARGET_PROPERTIES(mysql_install_db PROPERTIES COMPILE_FLAGS -DINSTALL_PLUGINDIR=${INSTALL_PLUGINDIR})
-  TARGET_LINK_LIBRARIES(mysql_install_db mysys)
+  TARGET_LINK_LIBRARIES(mysql_install_db mysys shlwapi)
 
   ADD_LIBRARY(winservice STATIC winservice.c)
   TARGET_LINK_LIBRARIES(winservice shell32)
+
   MYSQL_ADD_EXECUTABLE(mysql_upgrade_service
     mysql_upgrade_service.cc
-    COMPONENT Server)	
+    upgrade_conf_file.cc
+    COMPONENT Server)
   TARGET_LINK_LIBRARIES(mysql_upgrade_service mysys winservice)
 ENDIF(WIN32)
 

@@ -26,8 +26,7 @@ Created 5/7/1996 Heikki Tuuri
 
 #define LOCK_MODULE_IMPLEMENTATION
 
-
-#include "ha_prototypes.h"
+#include "univ.i"
 
 #include <mysql/service_thd_error_context.h>
 #include <sql_class.h>
@@ -37,11 +36,8 @@ Created 5/7/1996 Heikki Tuuri
 #include "dict0mem.h"
 #include "trx0purge.h"
 #include "trx0sys.h"
-#include "srv0mon.h"
 #include "ut0vec.h"
-#include "btr0btr.h"
-#include "dict0boot.h"
-#include "ut0new.h"
+#include "btr0cur.h"
 #include "row0sel.h"
 #include "row0mysql.h"
 #include "row0vers.h"
@@ -3289,47 +3285,54 @@ lock_update_discard(
 
 	lock_mutex_enter();
 
-	if (!lock_rec_get_first_on_page(lock_sys.rec_hash, block)
-	    && (!lock_rec_get_first_on_page(lock_sys.prdt_hash, block))) {
-		/* No locks exist on page, nothing to do */
+	if (lock_rec_get_first_on_page(lock_sys.rec_hash, block)) {
+		ut_ad(!lock_rec_get_first_on_page(lock_sys.prdt_hash, block));
+		ut_ad(!lock_rec_get_first_on_page(lock_sys.prdt_page_hash,
+						  block));
+		/* Inherit all the locks on the page to the record and
+		reset all the locks on the page */
 
-		lock_mutex_exit();
+		if (page_is_comp(page)) {
+			rec = page + PAGE_NEW_INFIMUM;
 
-		return;
-	}
+			do {
+				heap_no = rec_get_heap_no_new(rec);
 
-	/* Inherit all the locks on the page to the record and reset all
-	the locks on the page */
+				lock_rec_inherit_to_gap(heir_block, block,
+							heir_heap_no, heap_no);
 
-	if (page_is_comp(page)) {
-		rec = page + PAGE_NEW_INFIMUM;
+				lock_rec_reset_and_release_wait(
+					block, heap_no);
 
-		do {
-			heap_no = rec_get_heap_no_new(rec);
+				rec = page + rec_get_next_offs(rec, TRUE);
+			} while (heap_no != PAGE_HEAP_NO_SUPREMUM);
+		} else {
+			rec = page + PAGE_OLD_INFIMUM;
 
-			lock_rec_inherit_to_gap(heir_block, block,
-						heir_heap_no, heap_no);
+			do {
+				heap_no = rec_get_heap_no_old(rec);
 
-			lock_rec_reset_and_release_wait(block, heap_no);
+				lock_rec_inherit_to_gap(heir_block, block,
+							heir_heap_no, heap_no);
 
-			rec = page + rec_get_next_offs(rec, TRUE);
-		} while (heap_no != PAGE_HEAP_NO_SUPREMUM);
+				lock_rec_reset_and_release_wait(
+					block, heap_no);
+
+				rec = page + rec_get_next_offs(rec, FALSE);
+			} while (heap_no != PAGE_HEAP_NO_SUPREMUM);
+		}
+
+		lock_rec_free_all_from_discard_page_low(
+			block->page.id.space(), block->page.id.page_no(),
+			lock_sys.rec_hash);
 	} else {
-		rec = page + PAGE_OLD_INFIMUM;
-
-		do {
-			heap_no = rec_get_heap_no_old(rec);
-
-			lock_rec_inherit_to_gap(heir_block, block,
-						heir_heap_no, heap_no);
-
-			lock_rec_reset_and_release_wait(block, heap_no);
-
-			rec = page + rec_get_next_offs(rec, FALSE);
-		} while (heap_no != PAGE_HEAP_NO_SUPREMUM);
+		lock_rec_free_all_from_discard_page_low(
+			block->page.id.space(), block->page.id.page_no(),
+			lock_sys.prdt_hash);
+		lock_rec_free_all_from_discard_page_low(
+			block->page.id.space(), block->page.id.page_no(),
+			lock_sys.prdt_page_hash);
 	}
-
-	lock_rec_free_all_from_discard_page(block);
 
 	lock_mutex_exit();
 }
@@ -4250,6 +4253,7 @@ lock_check_dict_lock(
 	const lock_t*	lock)	/*!< in: lock to check */
 {
 	if (lock_get_type_low(lock) == LOCK_REC) {
+		ut_ad(!lock->index->table->is_temporary());
 
 		/* Check if the transcation locked a record
 		in a system table in X mode. It should have set
@@ -4263,9 +4267,8 @@ lock_check_dict_lock(
 	} else {
 		ut_ad(lock_get_type_low(lock) & LOCK_TABLE);
 
-		const dict_table_t*	table;
-
-		table = lock->un_member.tab_lock.table;
+		const dict_table_t* table = lock->un_member.tab_lock.table;
+		ut_ad(!table->is_temporary());
 
 		/* Check if the transcation locked a system table
 		in IX mode. It should have set the dict_op code
@@ -4604,14 +4607,14 @@ lock_print_info_summary(
 	fprintf(file,
 		"Purge done for trx's n:o < " TRX_ID_FMT
 		" undo n:o < " TRX_ID_FMT " state: %s\n"
-		"History list length " ULINTPF "\n",
+		"History list length %u\n",
 		purge_sys.tail.trx_no(),
 		purge_sys.tail.undo_no,
 		purge_sys.enabled()
 		? (purge_sys.running() ? "running"
 		   : purge_sys.paused() ? "stopped" : "running but idle")
 		: "disabled",
-		trx_sys.history_size());
+		uint32_t{trx_sys.rseg_history_len});
 
 #ifdef PRINT_NUM_OF_LOCK_STRUCTS
 	fprintf(file,
@@ -4909,6 +4912,8 @@ lock_rec_queue_validate(
 		goto func_exit;
 	}
 
+	ut_ad(page_rec_is_leaf(rec));
+
 	if (index == NULL) {
 
 		/* Nothing we can do */
@@ -5071,11 +5076,13 @@ loop:
 	if (!sync_check_find(SYNC_FSP))
 	for (i = nth_bit; i < lock_rec_get_n_bits(lock); i++) {
 
-		if (i == 1 || lock_rec_get_nth_bit(lock, i)) {
+		if (i == PAGE_HEAP_NO_SUPREMUM
+		    || lock_rec_get_nth_bit(lock, i)) {
 
 			rec = page_find_rec_with_heap_no(block->frame, i);
 			ut_a(rec);
-			ut_ad(page_rec_is_leaf(rec));
+			ut_ad(!lock_rec_get_nth_bit(lock, i)
+			      || page_rec_is_leaf(rec));
 			offsets = rec_get_offsets(rec, lock->index, offsets,
 						  true, ULINT_UNDEFINED,
 						  &heap);
@@ -5294,7 +5301,7 @@ lock_rec_insert_check_and_lock(
 {
 	ut_ad(block->frame == page_align(rec));
 	ut_ad(!dict_index_is_online_ddl(index)
-	      || dict_index_is_clust(index)
+	      || index->is_primary()
 	      || (flags & BTR_CREATE_FLAG));
 	ut_ad(mtr->is_named_space(index->table->space));
 	ut_ad(page_rec_is_leaf(rec));
@@ -5305,6 +5312,7 @@ lock_rec_insert_check_and_lock(
 	}
 
 	ut_ad(!index->table->is_temporary());
+	ut_ad(page_is_leaf(block->frame));
 
 	dberr_t		err;
 	lock_t*		lock;
@@ -6124,10 +6132,8 @@ lock_get_table_id(
 /*==============*/
 	const lock_t*	lock)	/*!< in: lock */
 {
-	dict_table_t*	table;
-
-	table = lock_get_table(lock);
-
+	dict_table_t* table = lock_get_table(lock);
+	ut_ad(!table->is_temporary());
 	return(table->id);
 }
 

@@ -24,11 +24,8 @@ Insert into a table
 Created 4/20/1996 Heikki Tuuri
 *******************************************************/
 
-#include "ha_prototypes.h"
-
 #include "row0ins.h"
 #include "dict0dict.h"
-#include "dict0boot.h"
 #include "trx0rec.h"
 #include "trx0undo.h"
 #include "btr0btr.h"
@@ -38,7 +35,6 @@ Created 4/20/1996 Heikki Tuuri
 #include "que0que.h"
 #include "row0upd.h"
 #include "row0sel.h"
-#include "row0row.h"
 #include "row0log.h"
 #include "rem0cmp.h"
 #include "lock0lock.h"
@@ -48,8 +44,6 @@ Created 4/20/1996 Heikki Tuuri
 #include "buf0lru.h"
 #include "fts0fts.h"
 #include "fts0types.h"
-#include "m_string.h"
-#include "gis0geo.h"
 
 /*************************************************************************
 IMPORTANT NOTE: Any operation that generates redo MUST check that there
@@ -1276,8 +1270,10 @@ row_ins_foreign_check_on_constraint(
 	}
 
 	if (table->fts) {
-		doc_id = fts_get_doc_id_from_rec(table, clust_rec,
-						 clust_index, tmp_heap);
+		doc_id = fts_get_doc_id_from_rec(
+			clust_rec, clust_index,
+			rec_get_offsets(clust_rec, clust_index, NULL, true,
+					ULINT_UNDEFINED, &tmp_heap));
 	}
 
 	if (node->is_delete
@@ -1916,9 +1912,12 @@ do_possible_lock_wait:
 
 		thr->lock_state = QUE_THR_LOCK_NOLOCK;
 
-		if (check_table->to_be_dropped
-		    || trx->error_state == DB_LOCK_WAIT_TIMEOUT) {
+		err = trx->error_state;
+		if (err != DB_SUCCESS) {
+		} else if (check_table->to_be_dropped) {
 			err = DB_LOCK_WAIT_TIMEOUT;
+		} else {
+			err = DB_LOCK_WAIT;
 		}
 
 		check_table->dec_fk_checks();
@@ -2338,10 +2337,10 @@ row_ins_duplicate_error_in_clust(
 						  true,
 						  ULINT_UNDEFINED, &heap);
 
-			ulint lock_type;
-
-			lock_type =
+			ulint lock_type =
 				trx->isolation_level <= TRX_ISO_READ_COMMITTED
+				|| (trx->mysql_thd
+				    && !thd_rpl_stmt_based(trx->mysql_thd))
 				? LOCK_REC_NOT_GAP : LOCK_ORDINARY;
 
 			/* We set a lock on the possible duplicate: this
@@ -2381,10 +2380,7 @@ row_ins_duplicate_error_in_clust(
 
 			if (row_ins_dupl_error_with_rec(
 				    rec, entry, cursor->index, offsets)) {
-duplicate:
-				trx->error_info = cursor->index;
-				err = DB_DUPLICATE_KEY;
-				goto func_exit;
+				goto duplicate;
 			}
 		}
 	}
@@ -2427,7 +2423,10 @@ duplicate:
 
 			if (row_ins_dupl_error_with_rec(
 				    rec, entry, cursor->index, offsets)) {
-				goto duplicate;
+duplicate:
+				trx->error_info = cursor->index;
+				err = DB_DUPLICATE_KEY;
+				goto func_exit;
 			}
 		}
 
@@ -2594,25 +2593,32 @@ row_ins_clust_index_entry_low(
 	} else {
 		index->set_modified(mtr);
 
-		if (mode == BTR_MODIFY_LEAF
-		    && dict_index_is_online_ddl(index)) {
-			mode = BTR_MODIFY_LEAF_ALREADY_S_LATCHED;
-			mtr_s_lock(dict_index_get_lock(index), &mtr);
-		}
+		if (UNIV_UNLIKELY(entry->is_metadata())) {
+			ut_ad(index->is_instant());
+			ut_ad(!dict_index_is_online_ddl(index));
+			ut_ad(mode == BTR_MODIFY_TREE);
+		} else {
+			if (mode == BTR_MODIFY_LEAF
+			    && dict_index_is_online_ddl(index)) {
+				mode = BTR_MODIFY_LEAF_ALREADY_S_LATCHED;
+				mtr_s_lock(dict_index_get_lock(index), &mtr);
+			}
 
-		if (unsigned ai = index->table->persistent_autoinc) {
-			/* Prepare to persist the AUTO_INCREMENT value
-			from the index entry to PAGE_ROOT_AUTO_INC. */
-			const dfield_t* dfield = dtuple_get_nth_field(
-				entry, ai - 1);
-			auto_inc = dfield_is_null(dfield)
-				? 0
-				: row_parse_int(static_cast<const byte*>(
+			if (unsigned ai = index->table->persistent_autoinc) {
+				/* Prepare to persist the AUTO_INCREMENT value
+				from the index entry to PAGE_ROOT_AUTO_INC. */
+				const dfield_t* dfield = dtuple_get_nth_field(
+					entry, ai - 1);
+				if (!dfield_is_null(dfield)) {
+					auto_inc = row_parse_int(
+						static_cast<const byte*>(
 							dfield->data),
 						dfield->len,
 						dfield->type.mtype,
 						dfield->type.prtype
 						& DATA_UNSIGNED);
+				}
+			}
 		}
 	}
 
@@ -3072,9 +3078,11 @@ row_ins_sec_index_entry_low(
 	if (!(flags & BTR_NO_LOCKING_FLAG)
 	    && dict_index_is_unique(index)
 	    && thr_get_trx(thr)->duplicates
-	    && thr_get_trx(thr)->isolation_level >= TRX_ISO_REPEATABLE_READ) {
+	    && thr_get_trx(thr)->isolation_level >= TRX_ISO_REPEATABLE_READ
+	    && thd_rpl_stmt_based(thr_get_trx(thr)->mysql_thd)) {
 
-		/* When using the REPLACE statement or ON DUPLICATE clause, a
+		/* In statement-based replication, when replicating a
+		REPLACE statement or ON DUPLICATE KEY UPDATE clause, a
 		gap lock is taken on the position of the to-be-inserted record,
 		to avoid other concurrent transactions from inserting the same
 		record. */
@@ -3643,14 +3651,15 @@ row_ins(
 	ins_node_t*	node,	/*!< in: row insert node */
 	que_thr_t*	thr)	/*!< in: query thread */
 {
-	dberr_t	err;
-
 	DBUG_ENTER("row_ins");
 
 	DBUG_PRINT("row_ins", ("table: %s", node->table->name.m_name));
 
+	trx_t* trx = thr_get_trx(thr);
+
 	if (node->duplicate) {
-		thr_get_trx(thr)->error_state = DB_DUPLICATE_KEY;
+		ut_ad(thd_rpl_stmt_based(trx->mysql_thd));
+		trx->error_state = DB_DUPLICATE_KEY;
 	}
 
 	if (node->state == INS_NODE_ALLOC_ROW_ID) {
@@ -3676,7 +3685,7 @@ row_ins(
 
 	while (node->index != NULL) {
 		if (node->index->type != DICT_FTS) {
-			err = row_ins_index_entry_step(node, thr);
+			dberr_t err = row_ins_index_entry_step(node, thr);
 
 			switch (err) {
 			case DB_SUCCESS:
@@ -3689,9 +3698,11 @@ row_ins(
 			case DB_DUPLICATE_KEY:
 				ut_ad(dict_index_is_unique(node->index));
 
-				if (thr_get_trx(thr)->isolation_level
+				if (trx->isolation_level
 				    >= TRX_ISO_REPEATABLE_READ
-				    && thr_get_trx(thr)->duplicates) {
+				    && trx->duplicates
+				    && !node->table->is_temporary()
+				    && thd_rpl_stmt_based(trx->mysql_thd)) {
 
 					/* When we are in REPLACE statement or
 					INSERT ..  ON DUPLICATE UPDATE
@@ -3754,7 +3765,7 @@ row_ins(
 						/* Save 1st dup error. Ignore
 						subsequent dup errors. */
 						node->duplicate = node->index;
-						thr_get_trx(thr)->error_state
+						trx->error_state
 							= DB_DUPLICATE_KEY;
 					}
 					break;
@@ -3763,18 +3774,6 @@ row_ins(
 			default:
 				DBUG_RETURN(err);
 			}
-		}
-
-		if (node->duplicate && node->table->is_temporary()) {
-			ut_ad(thr_get_trx(thr)->error_state
-			      == DB_DUPLICATE_KEY);
-			/* For TEMPORARY TABLE, we won't lock anything,
-			so we can simply break here instead of requiring
-			GAP locks for other unique secondary indexes,
-			pretending we have consumed all indexes. */
-			node->index = NULL;
-			node->entry = NULL;
-			break;
 		}
 
 		node->index = dict_table_get_next_index(node->index);
@@ -3795,6 +3794,7 @@ row_ins(
 		insertion will take place.  These gap locks are needed
 		only for unique indexes.  So skipping non-unique indexes. */
 		if (node->duplicate) {
+			ut_ad(thd_rpl_stmt_based(trx->mysql_thd));
 			while (node->index
 			       && !dict_index_is_unique(node->index)) {
 
@@ -3803,13 +3803,13 @@ row_ins(
 				node->entry = UT_LIST_GET_NEXT(tuple_list,
 							       node->entry);
 			}
-			thr_get_trx(thr)->error_state = DB_DUPLICATE_KEY;
+			trx->error_state = DB_DUPLICATE_KEY;
 		}
 	}
 
 	ut_ad(node->entry == NULL);
 
-	thr_get_trx(thr)->error_info = node->duplicate;
+	trx->error_info = node->duplicate;
 	node->state = INS_NODE_ALLOC_ROW_ID;
 
 	DBUG_RETURN(node->duplicate ? DB_DUPLICATE_KEY : DB_SUCCESS);

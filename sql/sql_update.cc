@@ -1255,7 +1255,7 @@ bool mysql_prepare_update(THD *thd, TABLE_LIST *table_list,
   table_list->register_want_access(SELECT_ACL);
 #endif
 
-  thd->lex->allow_sum_func= 0;
+  thd->lex->allow_sum_func.clear_all();
 
   /*
     We do not call DT_MERGE_FOR_INSERT because it has no sense for simple
@@ -2580,7 +2580,7 @@ int multi_update::do_updates()
     check_opt_it.rewind();
     while(TABLE *tbl= check_opt_it++)
     {
-      if (unlikely((local_error= tbl->file->ha_rnd_init(1))))
+      if (unlikely((local_error= tbl->file->ha_rnd_init(0))))
       {
         err_table= tbl;
         goto err;

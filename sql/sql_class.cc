@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2017, MariaDB Corporation.
+   Copyright (c) 2008, 2018, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -68,7 +68,6 @@
 #include "wsrep_mysqld.h"
 #include "wsrep_thd.h"
 #include "sql_connect.h"
-#include "my_atomic.h"
 
 #ifdef HAVE_SYS_SYSCALL_H
 #include <sys/syscall.h>
@@ -668,6 +667,7 @@ THD::THD(my_thread_id id, bool is_wsrep_applier, bool skip_global_sys_var_lock)
   main_da.init();
 
   mdl_context.init(this);
+  mdl_backup_lock= 0;
 
   /*
     Pass nominal parameters to init_alloc_root only to ensure that
@@ -1219,6 +1219,7 @@ void THD::init(bool skip_lock)
   first_successful_insert_id_in_prev_stmt= 0;
   first_successful_insert_id_in_prev_stmt_for_binlog= 0;
   first_successful_insert_id_in_cur_stmt= 0;
+  current_backup_stage= BACKUP_FINISHED;
 #ifdef WITH_WSREP
   wsrep_exec_mode= wsrep_applier ? REPL_RECV :  LOCAL_STATE;
   wsrep_conflict_state= NO_CONFLICT;
@@ -1486,6 +1487,9 @@ void THD::cleanup(void)
     metadata locks. Release them.
   */
   mdl_context.release_transactional_locks();
+
+  backup_end(this);
+  backup_unlock(this);
 
   /* Release the global read lock, if acquired. */
   if (global_read_lock.is_acquired())
@@ -2494,6 +2498,16 @@ void THD::update_charset()
                               &not_used);
 }
 
+void THD::give_protection_error()
+{
+  if (current_backup_stage != BACKUP_FINISHED)
+    my_error(ER_BACKUP_LOCK_IS_ACTIVE, MYF(0));
+  else
+  {
+    DBUG_ASSERT(global_read_lock.is_acquired());
+    my_error(ER_CANT_UPDATE_WITH_READLOCK, MYF(0));
+  }
+}
 
 /* routings to adding tables to list of changed in transaction tables */
 
@@ -3238,6 +3252,10 @@ int select_export::send_data(List<Item> &items)
       error_pos= copier.most_important_error_pos();
       if (unlikely(error_pos))
       {
+        /*
+          TODO: 
+             add new error message that will show user this printable_buff
+
         char printable_buff[32];
         convert_to_printable(printable_buff, sizeof(printable_buff),
                              error_pos, res->ptr() + res->length() - error_pos,
@@ -3246,6 +3264,11 @@ int select_export::send_data(List<Item> &items)
                             ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
                             ER_THD(thd, ER_TRUNCATED_WRONG_VALUE_FOR_FIELD),
                             "string", printable_buff,
+                            item->name.str, static_cast<long>(row_count));
+        */
+        push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+                            ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
+                            ER_THD(thd, WARN_DATA_TRUNCATED),
                             item->name.str, static_cast<long>(row_count));
       }
       else if (copier.source_end_pos() < res->ptr() + res->length())
@@ -4786,6 +4809,15 @@ extern "C" int thd_slave_thread(const MYSQL_THD thd)
   return(thd->slave_thread);
 }
 
+
+extern "C" int thd_rpl_stmt_based(const MYSQL_THD thd)
+{
+  return thd &&
+    !thd->is_current_stmt_binlog_format_row() &&
+    !thd->is_current_stmt_binlog_disabled();
+}
+
+
 /* Returns high resolution timestamp for the start
   of the current query. */
 extern "C" unsigned long long thd_start_utime(const MYSQL_THD thd)
@@ -5570,34 +5602,34 @@ class XID_cache_element
     ACQUIRED and RECOVERED flags are cleared before element is deleted from
     hash in a spin loop, after last reference is released.
   */
-  int32 m_state;
+  std::atomic<int32_t> m_state;
 public:
   static const int32 ACQUIRED= 1 << 30;
   static const int32 RECOVERED= 1 << 29;
   XID_STATE *m_xid_state;
-  bool is_set(int32 flag)
-  { return my_atomic_load32_explicit(&m_state, MY_MEMORY_ORDER_RELAXED) & flag; }
-  void set(int32 flag)
+  bool is_set(int32_t flag)
+  { return m_state.load(std::memory_order_relaxed) & flag; }
+  void set(int32_t flag)
   {
     DBUG_ASSERT(!is_set(ACQUIRED | RECOVERED));
-    my_atomic_add32_explicit(&m_state, flag, MY_MEMORY_ORDER_RELAXED);
+    m_state.fetch_add(flag, std::memory_order_relaxed);
   }
   bool lock()
   {
-    int32 old= my_atomic_add32_explicit(&m_state, 1, MY_MEMORY_ORDER_ACQUIRE);
+    int32_t old= m_state.fetch_add(1, std::memory_order_acquire);
     if (old & (ACQUIRED | RECOVERED))
       return true;
     unlock();
     return false;
   }
   void unlock()
-  { my_atomic_add32_explicit(&m_state, -1, MY_MEMORY_ORDER_RELEASE); }
+  { m_state.fetch_sub(1, std::memory_order_release); }
   void mark_uninitialized()
   {
-    int32 old= ACQUIRED;
-    while (!my_atomic_cas32_weak_explicit(&m_state, &old, 0,
-                                          MY_MEMORY_ORDER_RELAXED,
-                                          MY_MEMORY_ORDER_RELAXED))
+    int32_t old= ACQUIRED;
+    while (!m_state.compare_exchange_weak(old, 0,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed))
     {
       old&= ACQUIRED | RECOVERED;
       (void) LF_BACKOFF();
@@ -5605,10 +5637,10 @@ public:
   }
   bool acquire_recovered()
   {
-    int32 old= RECOVERED;
-    while (!my_atomic_cas32_weak_explicit(&m_state, &old, ACQUIRED | RECOVERED,
-                                          MY_MEMORY_ORDER_RELAXED,
-                                          MY_MEMORY_ORDER_RELAXED))
+    int32_t old= RECOVERED;
+    while (!m_state.compare_exchange_weak(old, ACQUIRED | RECOVERED,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed))
     {
       if (!(old & RECOVERED) || (old & ACQUIRED))
         return false;

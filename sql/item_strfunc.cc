@@ -4544,7 +4544,7 @@ bool Item_func_dyncol_create::prepare_arguments(THD *thd, bool force_names_arg)
     case DYN_COL_DATETIME:
     case DYN_COL_DATE:
       args[valpos]->get_date(thd, &vals[i].x.time_value,
-                             sql_mode_for_dates(thd));
+                             Datetime::Options(thd));
       break;
     case DYN_COL_TIME:
       args[valpos]->get_time(thd, &vals[i].x.time_value);
@@ -5135,7 +5135,7 @@ bool Item_dyncol_get::get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydat
     {
       longlong llval = (longlong)val.x.ulong_value;
       if (int_to_datetime_with_warn(thd, Longlong_hybrid(llval, !signed_value),
-                                    ltime, fuzzydate, 0 /* TODO */))
+                                    ltime, fuzzydate, 0, 0 /* TODO */))
         goto null;
       return 0;
     }
@@ -5144,12 +5144,12 @@ bool Item_dyncol_get::get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydat
     /* fall through */
   case DYN_COL_DOUBLE:
     if (double_to_datetime_with_warn(thd, val.x.double_value, ltime, fuzzydate,
-                                     0 /* TODO */))
+                                     0, 0 /* TODO */))
       goto null;
     return 0;
   case DYN_COL_DECIMAL:
     if (decimal_to_datetime_with_warn(thd, (my_decimal*)&val.x.decimal.value,
-                                      ltime, fuzzydate, 0 /* TODO */))
+                                      ltime, fuzzydate, 0, 0 /* TODO */))
       goto null;
     return 0;
   case DYN_COL_STRING:

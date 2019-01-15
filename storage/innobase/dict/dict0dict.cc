@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
 Copyright (c) 2013, 2018, MariaDB Corporation.
 
@@ -60,7 +60,6 @@ ib_warn_row_too_big(const dict_table_t*	table);
 #include "dict0mem.h"
 #include "dict0priv.h"
 #include "dict0stats.h"
-#include "fsp0sysspace.h"
 #include "fts0fts.h"
 #include "fts0types.h"
 #include "lock0lock.h"
@@ -81,7 +80,6 @@ ib_warn_row_too_big(const dict_table_t*	table);
 #include "srv0start.h"
 #include "sync0sync.h"
 #include "trx0undo.h"
-#include "ut0new.h"
 
 #include <vector>
 #include <algorithm>
@@ -408,6 +406,27 @@ dict_table_stats_unlock(
 	}
 }
 
+
+/** Open a persistent table.
+@param[in]	table_id	persistent table identifier
+@param[in]	ignore_err	errors to ignore
+@param[in]	cached_only	whether to skip loading
+@return persistent table
+@retval	NULL if not found */
+static dict_table_t* dict_table_open_on_id_low(
+	table_id_t		table_id,
+	dict_err_ignore_t	ignore_err,
+	bool			cached_only)
+{
+	dict_table_t* table = dict_sys->get_table(table_id);
+
+	if (!table && !cached_only) {
+		table = dict_load_table_on_id(table_id, ignore_err);
+	}
+
+	return table;
+}
+
 /**********************************************************************//**
 Try to drop any indexes after an aborted index creation.
 This can also be after a server kill during DROP INDEX. */
@@ -418,7 +437,7 @@ dict_table_try_drop_aborted(
 	dict_table_t*	table,		/*!< in: table, or NULL if it
 					needs to be looked up again */
 	table_id_t	table_id,	/*!< in: table identifier */
-	int32		ref_count)	/*!< in: expected table->n_ref_count */
+	uint32_t	ref_count)	/*!< in: expected table->n_ref_count */
 {
 	trx_t*		trx;
 
@@ -1086,20 +1105,19 @@ dict_init(void)
 	dict_operation_lock = static_cast<rw_lock_t*>(
 		ut_zalloc_nokey(sizeof(*dict_operation_lock)));
 
-	dict_sys = static_cast<dict_sys_t*>(ut_zalloc_nokey(sizeof(*dict_sys)));
+	dict_sys = new (ut_zalloc_nokey(sizeof(*dict_sys))) dict_sys_t();
 
 	UT_LIST_INIT(dict_sys->table_LRU, &dict_table_t::table_LRU);
 	UT_LIST_INIT(dict_sys->table_non_LRU, &dict_table_t::table_LRU);
 
 	mutex_create(LATCH_ID_DICT_SYS, &dict_sys->mutex);
 
-	dict_sys->table_hash = hash_create(
-		buf_pool_get_curr_size()
-		/ (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE));
+	const ulint hash_size = buf_pool_get_curr_size()
+		/ (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE);
 
-	dict_sys->table_id_hash = hash_create(
-		buf_pool_get_curr_size()
-		/ (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE));
+	dict_sys->table_hash = hash_create(hash_size);
+	dict_sys->table_id_hash = hash_create(hash_size);
+	dict_sys->temp_id_hash = hash_create(hash_size);
 
 	rw_lock_create(dict_operation_lock_key,
 		       dict_operation_lock, SYNC_DICT_OPERATION);
@@ -1259,8 +1277,7 @@ dict_table_add_system_columns(
 }
 
 /** Add the table definition to the data dictionary cache */
-void
-dict_table_t::add_to_cache()
+void dict_table_t::add_to_cache()
 {
 	ut_ad(dict_lru_validate());
 	ut_ad(mutex_own(&dict_sys->mutex));
@@ -1268,7 +1285,6 @@ dict_table_t::add_to_cache()
 	cached = TRUE;
 
 	ulint fold = ut_fold_string(name.m_name);
-	ulint id_fold = ut_fold_ull(id);
 
 	/* Look for a table with the same name: error if such exists */
 	{
@@ -1286,31 +1302,30 @@ dict_table_t::add_to_cache()
 		ut_ad(table2 == NULL);
 #endif /* UNIV_DEBUG */
 	}
+	HASH_INSERT(dict_table_t, name_hash, dict_sys->table_hash, fold,
+		    this);
 
 	/* Look for a table with the same id: error if such exists */
+	hash_table_t* id_hash = is_temporary()
+		? dict_sys->temp_id_hash : dict_sys->table_id_hash;
+	const ulint id_fold = ut_fold_ull(id);
 	{
 		dict_table_t*	table2;
-		HASH_SEARCH(id_hash, dict_sys->table_id_hash, id_fold,
+		HASH_SEARCH(id_hash, id_hash, id_fold,
 			    dict_table_t*, table2, ut_ad(table2->cached),
 			    table2->id == id);
 		ut_a(table2 == NULL);
 
 #ifdef UNIV_DEBUG
 		/* Look for the same table pointer with a different id */
-		HASH_SEARCH_ALL(id_hash, dict_sys->table_id_hash,
+		HASH_SEARCH_ALL(id_hash, id_hash,
 				dict_table_t*, table2, ut_ad(table2->cached),
 				table2 == this);
 		ut_ad(table2 == NULL);
 #endif /* UNIV_DEBUG */
+
+		HASH_INSERT(dict_table_t, id_hash, id_hash, id_fold, this);
 	}
-
-	/* Add table to hash table of tables */
-	HASH_INSERT(dict_table_t, name_hash, dict_sys->table_hash, fold,
-		    this);
-
-	/* Add table to hash table of tables based on table id */
-	HASH_INSERT(dict_table_t, id_hash, dict_sys->table_id_hash, id_fold,
-		    this);
 
 	if (can_be_evicted) {
 		UT_LIST_ADD_FIRST(dict_sys->table_LRU, this);
@@ -1957,6 +1972,7 @@ dict_table_change_id_in_cache(
 	ut_ad(table);
 	ut_ad(mutex_own(&dict_sys->mutex));
 	ut_ad(table->magic_n == DICT_TABLE_MAGIC_N);
+	ut_ad(!table->is_temporary());
 
 	/* Remove the table from the hash table of id's */
 
@@ -2014,8 +2030,10 @@ void dict_table_remove_from_cache(dict_table_t* table, bool lru, bool keep)
 	HASH_DELETE(dict_table_t, name_hash, dict_sys->table_hash,
 		    ut_fold_string(table->name.m_name), table);
 
-	HASH_DELETE(dict_table_t, id_hash, dict_sys->table_id_hash,
-		    ut_fold_ull(table->id), table);
+	hash_table_t* id_hash = table->is_temporary()
+		? dict_sys->temp_id_hash : dict_sys->table_id_hash;
+	const ulint id_fold = ut_fold_ull(table->id);
+	HASH_DELETE(dict_table_t, id_hash, id_hash, id_fold, table);
 
 	/* Remove table from LRU or non-LRU list. */
 	if (table->can_be_evicted) {
@@ -3265,8 +3283,6 @@ dict_foreign_find_index(
 
 	while (index != NULL) {
 		if (types_idx != index
-		    && !(index->type & DICT_FTS)
-		    && !dict_index_is_spatial(index)
 		    && !index->to_be_dropped
 		    && !dict_index_is_online_ddl(index)
 		    && dict_foreign_qualify_index(
@@ -5446,46 +5462,6 @@ dict_index_build_node_ptr(
 	return(tuple);
 }
 
-/**********************************************************************//**
-Copies an initial segment of a physical record, long enough to specify an
-index entry uniquely.
-@return pointer to the prefix record */
-rec_t*
-dict_index_copy_rec_order_prefix(
-/*=============================*/
-	const dict_index_t*	index,	/*!< in: index */
-	const rec_t*		rec,	/*!< in: record for which to
-					copy prefix */
-	ulint*			n_fields,/*!< out: number of fields copied */
-	byte**			buf,	/*!< in/out: memory buffer for the
-					copied prefix, or NULL */
-	ulint*			buf_size)/*!< in/out: buffer size */
-{
-	ulint		n;
-
-	UNIV_PREFETCH_R(rec);
-
-	if (dict_index_is_ibuf(index)) {
-		ut_ad(!dict_table_is_comp(index->table));
-		n = rec_get_n_fields_old(rec);
-	} else {
-		if (page_rec_is_leaf(rec)) {
-			n = dict_index_get_n_unique_in_tree(index);
-		} else if (dict_index_is_spatial(index)) {
-			ut_ad(dict_index_get_n_unique_in_tree_nonleaf(index)
-			      == DICT_INDEX_SPATIAL_NODEPTR_SIZE);
-			/* For R-tree, we have to compare
-			the child page numbers as well. */
-			n = DICT_INDEX_SPATIAL_NODEPTR_SIZE + 1;
-		} else {
-			n = dict_index_get_n_unique_in_tree(index);
-		}
-	}
-
-	*n_fields = n;
-	return(rec_copy_prefix_to_buf(rec, index, n, buf, buf_size));
-}
-
 /** Convert a physical record into a search tuple.
 @param[in]	rec		index record (not necessarily in an index page)
 @param[in]	index		index
@@ -6539,17 +6515,17 @@ dict_resize()
 	/* all table entries are in table_LRU and table_non_LRU lists */
 	hash_table_free(dict_sys->table_hash);
 	hash_table_free(dict_sys->table_id_hash);
+	hash_table_free(dict_sys->temp_id_hash);
 
-	dict_sys->table_hash = hash_create(
-		buf_pool_get_curr_size()
-		/ (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE));
-
-	dict_sys->table_id_hash = hash_create(
-		buf_pool_get_curr_size()
-		/ (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE));
+	const ulint hash_size = buf_pool_get_curr_size()
+		/ (DICT_POOL_PER_TABLE_HASH * UNIV_WORD_SIZE);
+	dict_sys->table_hash = hash_create(hash_size);
+	dict_sys->table_id_hash = hash_create(hash_size);
+	dict_sys->temp_id_hash = hash_create(hash_size);
 
 	for (table = UT_LIST_GET_FIRST(dict_sys->table_LRU); table;
 	     table = UT_LIST_GET_NEXT(table_LRU, table)) {
+		ut_ad(!table->is_temporary());
 		ulint	fold = ut_fold_string(table->name.m_name);
 		ulint	id_fold = ut_fold_ull(table->id);
 
@@ -6568,8 +6544,10 @@ dict_resize()
 		HASH_INSERT(dict_table_t, name_hash, dict_sys->table_hash,
 			    fold, table);
 
-		HASH_INSERT(dict_table_t, id_hash, dict_sys->table_id_hash,
-			    id_fold, table);
+		hash_table_t* id_hash = table->is_temporary()
+			? dict_sys->temp_id_hash : dict_sys->table_id_hash;
+
+		HASH_INSERT(dict_table_t, id_hash, id_hash, id_fold, table);
 	}
 
 	mutex_exit(&dict_sys->mutex);
@@ -6592,7 +6570,7 @@ dict_close(void)
 
 	/* Free the hash elements. We don't remove them from the table
 	because we are going to destroy the table anyway. */
-	for (ulint i = 0; i < hash_get_n_cells(dict_sys->table_id_hash); i++) {
+	for (ulint i = 0; i < hash_get_n_cells(dict_sys->table_hash); i++) {
 		dict_table_t*	table;
 
 		table = static_cast<dict_table_t*>(
@@ -6613,6 +6591,7 @@ dict_close(void)
 	/* The elements are the same instance as in dict_sys->table_hash,
 	therefore we don't delete the individual elements. */
 	hash_table_free(dict_sys->table_id_hash);
+	hash_table_free(dict_sys->temp_id_hash);
 
 	mutex_exit(&dict_sys->mutex);
 	mutex_free(&dict_sys->mutex);
@@ -6759,6 +6738,10 @@ dict_foreign_qualify_index(
 		return(false);
 	}
 
+	if (index->type & (DICT_SPATIAL | DICT_FTS)) {
+		return false;
+	}
+
 	for (ulint i = 0; i < n_cols; i++) {
 		dict_field_t*	field;
 		const char*	col_name;
@@ -6838,6 +6821,7 @@ dict_index_zip_pad_update(
 	ulint	fail_pct;
 
 	ut_ad(info);
+	ut_ad(info->pad % ZIP_PAD_INCR == 0);
 
 	total = info->success + info->failure;
 
@@ -6862,17 +6846,16 @@ dict_index_zip_pad_update(
 	if (fail_pct > zip_threshold) {
 		/* Compression failures are more then user defined
 		threshold. Increase the pad size to reduce chances of
-		compression failures. */
-		ut_ad(info->pad % ZIP_PAD_INCR == 0);
+		compression failures.
 
-		/* Only do increment if it won't increase padding
+		Only do increment if it won't increase padding
 		beyond max pad size. */
 		if (info->pad + ZIP_PAD_INCR
 		    < (srv_page_size * zip_pad_max) / 100) {
 			/* Use atomics even though we have the mutex.
 			This is to ensure that we are able to read
 			info->pad atomically. */
-			my_atomic_addlint(&info->pad, ZIP_PAD_INCR);
+			info->pad += ZIP_PAD_INCR;
 
 			MONITOR_INC(MONITOR_PAD_INCREMENTS);
 		}
@@ -6890,11 +6873,10 @@ dict_index_zip_pad_update(
 		if (info->n_rounds >= ZIP_PAD_SUCCESSFUL_ROUND_LIMIT
 		    && info->pad > 0) {
 
-			ut_ad(info->pad % ZIP_PAD_INCR == 0);
 			/* Use atomics even though we have the mutex.
 			This is to ensure that we are able to read
 			info->pad atomically. */
-			my_atomic_addlint(&info->pad, ulint(-ZIP_PAD_INCR));
+			info->pad -= ZIP_PAD_INCR;
 
 			info->n_rounds = 0;
 
@@ -6967,7 +6949,7 @@ dict_index_zip_pad_optimal_page_size(
 		return(srv_page_size);
 	}
 
-	pad = my_atomic_loadlint(&index->zip_pad.pad);
+	pad = index->zip_pad.pad;
 
 	ut_ad(pad < srv_page_size);
 	sz = srv_page_size - pad;

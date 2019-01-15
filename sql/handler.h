@@ -115,7 +115,13 @@ enum enum_alter_inplace_result {
 #define HA_NO_BLOBS            (1ULL << 9) /* Doesn't support blobs */
 #define HA_CAN_INDEX_BLOBS     (1ULL << 10)
 #define HA_AUTO_PART_KEY       (1ULL << 11) /* auto-increment in multi-part key */
-#define HA_REQUIRE_PRIMARY_KEY (1ULL << 12) /* .. and can't create a hidden one */
+/*
+  The engine requires every table to have a user-specified PRIMARY KEY.
+  Do not set the flag if the engine can generate a hidden primary key internally.
+  This flag is ignored if a SEQUENCE is created (which, in turn, needs
+  HA_CAN_TABLES_WITHOUT_ROLLBACK flag)
+*/
+#define HA_REQUIRE_PRIMARY_KEY (1ULL << 12)
 #define HA_STATS_RECORDS_IS_EXACT (1ULL << 13) /* stats.records is exact */
 /*
   INSERT_DELAYED only works with handlers that uses MySQL internal table
@@ -151,7 +157,6 @@ enum enum_alter_inplace_result {
 #define HA_HAS_OLD_CHECKSUM    (1ULL << 24)
 /* Table data are stored in separate files (for lower_case_table_names) */
 #define HA_FILE_BASED	       (1ULL << 26)
-#define HA_NO_VARCHAR	       (1ULL << 27) /* unused */
 #define HA_CAN_BIT_FIELD       (1ULL << 28) /* supports bit fields */
 #define HA_NEED_READ_RANGE_BUFFER (1ULL << 29) /* for read_multi_range */
 #define HA_ANY_INDEX_MAY_BE_UNIQUE (1ULL << 30)
@@ -300,7 +305,19 @@ enum enum_alter_inplace_result {
 #define HA_CAN_MULTISTEP_MERGE (1LL << 53)
 
 /* calling cmp_ref() on the engine is expensive */
-#define HA_CMP_REF_IS_EXPENSIVE (1ULL << 54)
+#define HA_SLOW_CMP_REF         (1ULL << 54)
+#define HA_CMP_REF_IS_EXPENSIVE HA_SLOW_CMP_REF
+
+/**
+  Some engines are unable to provide an efficient implementation for rnd_pos().
+  Server will try to avoid it, if possible
+
+  TODO better to do it with cost estimates, not with an explicit flag
+*/
+#define HA_SLOW_RND_POS  (1ULL << 55)
+
+/* Safe for online backup */
+#define HA_CAN_ONLINE_BACKUPS (1ULL << 56)
 
 /* bits in index_flags(index_number) for what you can do with index */
 #define HA_READ_NEXT            1       /* TODO really use this flag */
@@ -412,6 +429,12 @@ enum enum_alter_inplace_result {
 	/* Some key definitions */
 #define HA_KEY_NULL_LENGTH	1
 #define HA_KEY_BLOB_LENGTH	2
+
+/* Maximum length of any index lookup key, in bytes */
+
+#define MAX_KEY_LENGTH (MAX_DATA_LENGTH_FOR_KEY \
+                         +(MAX_REF_PARTS \
+                          *(HA_KEY_NULL_LENGTH + HA_KEY_BLOB_LENGTH)))
 
 #define HA_LEX_CREATE_TMP_TABLE	1U
 #define HA_CREATE_TMP_ALTER     8U
@@ -1599,6 +1622,10 @@ struct handlerton
    @return transaction commit ID
    @retval 0 if no system-versioned data was affected by the transaction */
    ulonglong (*prepare_commit_versioned)(THD *thd, ulonglong *trx_id);
+
+  /* backup */
+  void (*prepare_for_backup)(void);
+  void (*end_backup)(void);
 };
 
 
@@ -1906,6 +1933,8 @@ enum vers_sys_type_t
   VERS_TRX_ID
 };
 
+extern const LEX_CSTRING null_clex_str;
+
 struct Vers_parse_info
 {
   Vers_parse_info() :
@@ -1913,6 +1942,15 @@ struct Vers_parse_info
     versioned_fields(false),
     unversioned_fields(false)
   {}
+
+  void init() // Deep initialization
+  {
+    system_time= start_end_t(null_clex_str, null_clex_str);
+    as_row= start_end_t(null_clex_str, null_clex_str);
+    check_unit= VERS_UNDEFINED;
+    versioned_fields= false;
+    unversioned_fields= false;
+  }
 
   struct start_end_t
   {
@@ -1993,7 +2031,7 @@ public:
      - [AS] SELECT ...             // Copy structure from a subquery
 */
 
-struct Table_scope_and_contents_source_st
+struct Table_scope_and_contents_source_pod_st // For trivial members
 {
   CHARSET_INFO *table_charset;
   LEX_CUSTRING tabledef_version;
@@ -2019,7 +2057,6 @@ struct Table_scope_and_contents_source_st
   uint options;				/* OR of HA_CREATE_ options */
   uint merge_insert_method;
   uint extra_size;                      /* length of extra data segment */
-  SQL_I_List<TABLE_LIST> merge_list;
   handlerton *db_type;
   /**
     Row type of the table definition.
@@ -2053,15 +2090,6 @@ struct Table_scope_and_contents_source_st
   bool table_was_deleted;
   sequence_definition *seq_create_info;
 
-  Vers_parse_info vers_info;
-
-  bool vers_fix_system_fields(THD *thd, Alter_info *alter_info,
-                         const TABLE_LIST &create_table,
-                         bool create_select= false);
-
-  bool vers_check_system_fields(THD *thd, Alter_info *alter_info,
-                                const TABLE_LIST &create_table);
-
   bool vers_native(THD *thd) const;
 
   void init()
@@ -2079,6 +2107,30 @@ struct Table_scope_and_contents_source_st
   {
     return options & HA_VERSIONED_TABLE;
   }
+};
+
+
+struct Table_scope_and_contents_source_st:
+         public Table_scope_and_contents_source_pod_st
+{
+  SQL_I_List<TABLE_LIST> merge_list;
+
+  Vers_parse_info vers_info;
+
+  void init()
+  {
+    Table_scope_and_contents_source_pod_st::init();
+    merge_list.empty();
+    vers_info.init();
+  }
+
+  bool vers_fix_system_fields(THD *thd, Alter_info *alter_info,
+                         const TABLE_LIST &create_table,
+                         bool create_select= false);
+
+  bool vers_check_system_fields(THD *thd, Alter_info *alter_info,
+                                const TABLE_LIST &create_table);
+
 };
 
 
@@ -3755,14 +3807,14 @@ public:
   uint max_key_parts() const
   { return MY_MIN(MAX_REF_PARTS, max_supported_key_parts()); }
   uint max_key_length() const
-  { return MY_MIN(MAX_KEY_LENGTH, max_supported_key_length()); }
+  { return MY_MIN(MAX_DATA_LENGTH_FOR_KEY, max_supported_key_length()); }
   uint max_key_part_length() const
-  { return MY_MIN(MAX_KEY_LENGTH, max_supported_key_part_length()); }
+  { return MY_MIN(MAX_DATA_LENGTH_FOR_KEY, max_supported_key_part_length()); }
 
   virtual uint max_supported_record_length() const { return HA_MAX_REC_LENGTH; }
   virtual uint max_supported_keys() const { return 0; }
   virtual uint max_supported_key_parts() const { return MAX_REF_PARTS; }
-  virtual uint max_supported_key_length() const { return MAX_KEY_LENGTH; }
+  virtual uint max_supported_key_length() const { return MAX_DATA_LENGTH_FOR_KEY; }
   virtual uint max_supported_key_part_length() const { return 255; }
   virtual uint min_record_length(uint options) const { return 1; }
 
@@ -4637,6 +4689,7 @@ public:
   { DBUG_ASSERT(ht); return partition_ht()->flags & HTON_NATIVE_SYS_VERSIONING; }
   virtual void update_partition(uint	part_id)
   {}
+
 protected:
   Handler_share *get_ha_share_ptr();
   void set_ha_share_ptr(Handler_share *arg_ha_share);
@@ -4715,6 +4768,8 @@ int ha_create_table(THD *thd, const char *path,
                     HA_CREATE_INFO *create_info, LEX_CUSTRING *frm);
 int ha_delete_table(THD *thd, handlerton *db_type, const char *path,
                     const LEX_CSTRING *db, const LEX_CSTRING *alias, bool generate_warning);
+void ha_prepare_for_backup();
+void ha_end_backup();
 
 /* statistics and info */
 bool ha_show_status(THD *thd, handlerton *db_type, enum ha_stat_type stat);

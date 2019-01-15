@@ -41,7 +41,7 @@ Created 1/20/1994 Heikki Tuuri
 
 #define INNODB_VERSION_MAJOR	5
 #define INNODB_VERSION_MINOR	7
-#define INNODB_VERSION_BUGFIX	23
+#define INNODB_VERSION_BUGFIX	24
 
 /* The following is the InnoDB version as shown in
 SELECT plugin_version FROM information_schema.plugins;
@@ -83,6 +83,7 @@ used throughout InnoDB but do not include too much themselves.  They
 support cross-platform development and expose comonly used SQL names. */
 
 #include <my_global.h>
+#include "my_counter.h"
 
 /* JAN: TODO: missing 5.7 header */
 #ifdef HAVE_MY_THREAD_H

@@ -38,15 +38,14 @@
 #include "thr_timer.h"
 #include "thr_malloc.h"
 #include "log_slow.h"      /* LOG_SLOW_DISABLE_... */
-
 #include "sql_digest_stream.h"            // sql_digest_state
-
 #include <mysql/psi/mysql_stage.h>
 #include <mysql/psi/mysql_statement.h>
 #include <mysql/psi/mysql_idle.h>
 #include <mysql/psi/mysql_table.h>
 #include <mysql_com_server.h>
 #include "session_tracker.h"
+#include "backup.h"
 
 extern "C"
 void set_thd_stage_info(void *thd,
@@ -156,8 +155,15 @@ enum enum_binlog_row_image {
 #define MODE_HIGH_NOT_PRECEDENCE        (1ULL << 29)
 #define MODE_NO_ENGINE_SUBSTITUTION     (1ULL << 30)
 #define MODE_PAD_CHAR_TO_FULL_LENGTH    (1ULL << 31)
+/* SQL mode bits defined above are common for MariaDB and MySQL */
+#define MODE_MASK_MYSQL_COMPATIBLE      0xFFFFFFFFULL
+/* The following modes are specific to MariaDB */
 #define MODE_EMPTY_STRING_IS_NULL       (1ULL << 32)
 #define MODE_SIMULTANEOUS_ASSIGNMENT    (1ULL << 33)
+#define MODE_TIME_ROUND_FRACTIONAL      (1ULL << 34)
+/* The following modes are specific to MySQL */
+#define MODE_MYSQL80_TIME_TRUNCATE_FRACTIONAL (1ULL << 32)
+
 
 /* Bits for different old style modes */
 #define OLD_MODE_NO_DUP_KEY_WARNINGS_WITH_IGNORE	(1 << 0)
@@ -1946,42 +1952,22 @@ public:
 
   Global_read_lock()
     : m_state(GRL_NONE),
-      m_mdl_global_shared_lock(NULL),
-      m_mdl_blocks_commits_lock(NULL)
+      m_mdl_global_read_lock(NULL)
   {}
 
   bool lock_global_read_lock(THD *thd);
   void unlock_global_read_lock(THD *thd);
-  /**
-    Check if this connection can acquire protection against GRL and
-    emit error if otherwise.
-  */
-  bool can_acquire_protection() const
-  {
-    if (m_state)
-    {
-      my_error(ER_CANT_UPDATE_WITH_READLOCK, MYF(0));
-      return TRUE;
-    }
-    return FALSE;
-  }
   bool make_global_read_lock_block_commit(THD *thd);
   bool is_acquired() const { return m_state != GRL_NONE; }
   void set_explicit_lock_duration(THD *thd);
 private:
   enum_grl_state m_state;
   /**
-    In order to acquire the global read lock, the connection must
-    acquire shared metadata lock in GLOBAL namespace, to prohibit
-    all DDL.
+    Global read lock is acquired in two steps:
+    1. acquire MDL_BACKUP_FTWRL1 in BACKUP namespace to prohibit DDL and DML
+    2. upgrade to MDL_BACKUP_FTWRL2 to prohibit commits
   */
-  MDL_ticket *m_mdl_global_shared_lock;
-  /**
-    Also in order to acquire the global read lock, the connection
-    must acquire a shared metadata lock in COMMIT namespace, to
-    prohibit commits.
-  */
-  MDL_ticket *m_mdl_blocks_commits_lock;
+  MDL_ticket *m_mdl_global_read_lock;
 };
 
 
@@ -2193,6 +2179,7 @@ public:
     rpl_io_thread_info *rpl_io_info;
     rpl_sql_thread_info *rpl_sql_info;
   } system_thread_info;
+  MDL_ticket *mdl_backup_ticket, *mdl_backup_lock;
 
   void reset_for_next_command(bool do_clear_errors= 1);
   /*
@@ -2978,6 +2965,7 @@ public:
   uint	     tmp_table, global_disable_checkpoint;
   uint	     server_status,open_options;
   enum enum_thread_type system_thread;
+  enum backup_stages current_backup_stage;
   /*
     Current or next transaction isolation level.
     When a connection is established, the value is taken from
@@ -3415,6 +3403,15 @@ public:
   inline ulong query_start_sec_part()
   { query_start_sec_part_used=1; return start_time_sec_part; }
   MYSQL_TIME query_start_TIME();
+  Timeval query_start_timeval()
+  {
+    return Timeval(query_start(), query_start_sec_part());
+  }
+  time_round_mode_t temporal_round_mode() const
+  {
+    return variables.sql_mode & MODE_TIME_ROUND_FRACTIONAL ?
+           TIME_FRAC_ROUND : TIME_FRAC_TRUNCATE;
+  }
 
 private:
   struct {
@@ -3605,6 +3602,15 @@ public:
   inline bool in_active_multi_stmt_transaction()
   {
     return server_status & SERVER_STATUS_IN_TRANS;
+  }
+  void give_protection_error();
+  inline bool has_read_only_protection()
+  {
+    if (current_backup_stage == BACKUP_FINISHED &&
+        !global_read_lock.is_acquired())
+      return FALSE;
+    give_protection_error();
+    return TRUE;
   }
   inline bool fill_derived_tables()
   {
@@ -4413,14 +4419,23 @@ public:
   }
   void push_warning_truncated_value_for_field(Sql_condition::enum_warning_level
                                               level, const char *type_str,
-                                              const char *val, const char *name)
+                                              const char *val,
+                                              const TABLE_SHARE *s,
+                                              const char *name)
   {
     DBUG_ASSERT(name);
     char buff[MYSQL_ERRMSG_SIZE];
     CHARSET_INFO *cs= &my_charset_latin1;
+    const char *db_name= s ? s->db.str : NULL;
+    const char *table_name= s ? s->error_table_name() : NULL;
+
+    if (!db_name)
+      db_name= "";
+    if (!table_name)
+      table_name= "";
     cs->cset->snprintf(cs, buff, sizeof(buff),
                        ER_THD(this, ER_TRUNCATED_WRONG_VALUE_FOR_FIELD),
-                       type_str, val, name,
+                       type_str, val, db_name, table_name, name,
                        (ulong) get_stmt_da()->current_row_for_warning());
     push_warning(this, level, ER_TRUNCATED_WRONG_VALUE, buff);
 
@@ -4429,10 +4444,12 @@ public:
                                              bool totally_useless_value,
                                              const char *type_str,
                                              const char *val,
+                                             const TABLE_SHARE *s,
                                              const char *field_name)
   {
     if (field_name)
-      push_warning_truncated_value_for_field(level, type_str, val, field_name);
+      push_warning_truncated_value_for_field(level, type_str, val,
+                                             s, field_name);
     else if (totally_useless_value)
       push_warning_wrong_value(level, type_str, val);
     else
@@ -4953,16 +4970,17 @@ my_eof(THD *thd)
   (A)->variables.sql_log_bin_off= 0;}
 
 
-inline date_mode_t sql_mode_for_dates(THD *thd)
+inline date_conv_mode_t sql_mode_for_dates(THD *thd)
 {
-  static_assert(C_TIME_FUZZY_DATES   == date_mode_t::FUZZY_DATES &&
-                C_TIME_TIME_ONLY     == date_mode_t::TIME_ONLY,
-                "sql_mode_t and pure C library date flags must be equal");
+  static_assert((date_conv_mode_t::KNOWN_MODES &
+                time_round_mode_t::KNOWN_MODES) == 0,
+                "date_conv_mode_t and time_round_mode_t must use different "
+                "bit values");
   static_assert(MODE_NO_ZERO_DATE    == date_mode_t::NO_ZERO_DATE &&
                 MODE_NO_ZERO_IN_DATE == date_mode_t::NO_ZERO_IN_DATE &&
                 MODE_INVALID_DATES   == date_mode_t::INVALID_DATES,
                 "sql_mode_t and date_mode_t values must be equal");
-  return date_mode_t(thd->variables.sql_mode &
+  return date_conv_mode_t(thd->variables.sql_mode &
           (MODE_NO_ZERO_DATE | MODE_NO_ZERO_IN_DATE | MODE_INVALID_DATES));
 }
 
@@ -5111,6 +5129,14 @@ public:
     Currently all intercepting classes derive from select_result_interceptor.
   */
   virtual bool is_result_interceptor()=0;
+
+  /*
+    This method is used to distinguish an normal SELECT from the cursor
+    structure discovery for cursor%ROWTYPE routine variables.
+    If this method returns "true", then a SELECT execution performs only
+    all preparation stages, but does not fetch any rows.
+  */
+  virtual bool view_structure_only() const { return false; }
 };
 
 
@@ -5230,9 +5256,13 @@ private:
   {
     List<sp_variable> *spvar_list;
     uint field_count;
+    bool m_view_structure_only;
     bool send_data_to_variable_list(List<sp_variable> &vars, List<Item> &items);
   public:
-    Select_fetch_into_spvars(THD *thd_arg): select_result_interceptor(thd_arg) {}
+    Select_fetch_into_spvars(THD *thd_arg, bool view_structure_only)
+     :select_result_interceptor(thd_arg),
+      m_view_structure_only(view_structure_only)
+    {}
     void reset(THD *thd_arg)
     {
       select_result_interceptor::reset(thd_arg);
@@ -5245,16 +5275,17 @@ private:
     virtual bool send_eof() { return FALSE; }
     virtual int send_data(List<Item> &items);
     virtual int prepare(List<Item> &list, SELECT_LEX_UNIT *u);
+    virtual bool view_structure_only() const { return m_view_structure_only; }
 };
 
 public:
   sp_cursor()
-   :result(NULL),
+   :result(NULL, false),
     m_lex_keeper(NULL),
     server_side_cursor(NULL)
   { }
-  sp_cursor(THD *thd_arg, sp_lex_keeper *lex_keeper)
-   :result(thd_arg),
+  sp_cursor(THD *thd_arg, sp_lex_keeper *lex_keeper, bool view_structure_only)
+   :result(thd_arg, view_structure_only),
     m_lex_keeper(lex_keeper),
     server_side_cursor(NULL)
   {}
@@ -5265,8 +5296,6 @@ public:
   sp_lex_keeper *get_lex_keeper() { return m_lex_keeper; }
 
   int open(THD *thd);
-
-  int open_view_structure_only(THD *thd);
 
   int close(THD *thd);
 
@@ -6091,6 +6120,10 @@ class multi_delete :public select_result_interceptor
   */
   bool error_handled;
 
+public:
+  // Methods used by ColumnStore
+  uint get_num_of_tables() const { return num_of_tables; }
+  TABLE_LIST* get_tables() const { return delete_tables; }
 public:
   multi_delete(THD *thd_arg, TABLE_LIST *dt, uint num_of_tables);
   ~multi_delete();

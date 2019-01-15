@@ -1515,6 +1515,14 @@ static Sys_var_ulong Sys_max_connect_errors(
        VALID_RANGE(1, UINT_MAX), DEFAULT(MAX_CONNECT_ERRORS),
        BLOCK_SIZE(1));
 
+static Sys_var_uint Sys_max_password_errors(
+       "max_password_errors",
+       "If there is more than this number of failed connect attempts "
+       "due to invalid password, user will be blocked from further connections until FLUSH_PRIVILEGES.",
+       GLOBAL_VAR(max_password_errors), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(1, UINT_MAX), DEFAULT(UINT_MAX),
+       BLOCK_SIZE(1));
+
 static Sys_var_uint Sys_max_digest_length(
        "max_digest_length", "Maximum length considered for digest text.",
        READ_ONLY GLOBAL_VAR(max_digest_length),
@@ -1940,6 +1948,19 @@ Sys_var_last_gtid::session_value_ptr(THD *thd, const LEX_CSTRING *base)
 
   return (uchar *)p;
 }
+
+
+static Sys_var_uint Sys_gtid_cleanup_batch_size(
+       "gtid_cleanup_batch_size",
+       "Normally does not need tuning. How many old rows must accumulate in "
+       "the mysql.gtid_slave_pos table before a background job will be run to "
+       "delete them. Can be increased to reduce number of commits if "
+       "using many different engines with --gtid_pos_auto_engines, or to "
+       "reduce CPU overhead if using a huge number of different "
+       "gtid_domain_ids. Can be decreased to reduce number of old rows in the "
+       "table.",
+       GLOBAL_VAR(opt_gtid_cleanup_batch_size), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0,2147483647), DEFAULT(64), BLOCK_SIZE(1));
 
 
 static bool
@@ -2456,7 +2477,7 @@ static Sys_var_ulong Sys_optimizer_use_condition_selectivity(
        "5 - additionally use selectivity of certain non-range predicates "
        "calculated on record samples",
        SESSION_VAR(optimizer_use_condition_selectivity), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(1, 5), DEFAULT(1), BLOCK_SIZE(1));
+       VALID_RANGE(1, 5), DEFAULT(4), BLOCK_SIZE(1));
 
 static Sys_var_ulong Sys_optimizer_search_depth(
        "optimizer_search_depth",
@@ -2572,13 +2593,15 @@ static Sys_var_ulong Sys_read_buff_size(
 static bool check_read_only(sys_var *self, THD *thd, set_var *var)
 {
   /* Prevent self dead-lock */
-  if (thd->locked_tables_mode || thd->in_active_multi_stmt_transaction())
+  if (thd->locked_tables_mode || thd->in_active_multi_stmt_transaction() ||
+      thd->current_backup_stage != BACKUP_FINISHED)
   {
     my_error(ER_LOCK_OR_ACTIVE_TRANSACTION, MYF(0));
     return true;
   }
   return false;
 }
+
 static bool fix_read_only(sys_var *self, THD *thd, enum_var_type type)
 {
   bool result= true;
@@ -3353,6 +3376,7 @@ static const char *sql_mode_names[]=
   "ALLOW_INVALID_DATES", "ERROR_FOR_DIVISION_BY_ZERO", "TRADITIONAL",
   "NO_AUTO_CREATE_USER", "HIGH_NOT_PRECEDENCE", "NO_ENGINE_SUBSTITUTION",
   "PAD_CHAR_TO_FULL_LENGTH", "EMPTY_STRING_IS_NULL", "SIMULTANEOUS_ASSIGNMENT",
+  "TIME_ROUND_FRACTIONAL",
   0
 };
 
@@ -4116,7 +4140,7 @@ static Sys_var_bit Sys_safe_updates(
        "sql_safe_updates", "If set to 1, UPDATEs and DELETEs need either a key in "
        "the WHERE clause, or a LIMIT clause, or else they will aborted. Prevents "
        "the common mistake of accidentally deleting or updating every row in a table.",
-       SESSION_VAR(option_bits), NO_CMD_LINE, OPTION_SAFE_UPDATES,
+       SESSION_VAR(option_bits), CMD_LINE(OPT_ARG), OPTION_SAFE_UPDATES,
        DEFAULT(FALSE));
 
 static Sys_var_bit Sys_buffer_results(
@@ -5841,12 +5865,13 @@ static Sys_var_ulong Sys_progress_report_time(
        VALID_RANGE(0, UINT_MAX), DEFAULT(5), BLOCK_SIZE(1));
 
 const char *use_stat_tables_modes[] =
-           {"NEVER", "COMPLEMENTARY", "PREFERABLY", 0};
+           {"NEVER", "COMPLEMENTARY", "PREFERABLY",
+           "COMPLEMENTARY_FOR_QUERIES", "PREFERABLY_FOR_QUERIES", 0};
 static Sys_var_enum Sys_optimizer_use_stat_tables(
        "use_stat_tables",
        "Specifies how to use system statistics tables",
        SESSION_VAR(use_stat_tables), CMD_LINE(REQUIRED_ARG),
-       use_stat_tables_modes, DEFAULT(0));
+       use_stat_tables_modes, DEFAULT(4));
 
 static Sys_var_ulong Sys_histogram_size(
        "histogram_size",

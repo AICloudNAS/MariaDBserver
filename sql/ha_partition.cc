@@ -3516,7 +3516,8 @@ int ha_partition::open(const char *name, int mode, uint test_if_locked)
   if (init_partition_bitmaps())
     goto err_alloc;
 
-  if (unlikely((error=
+  if (!MY_TEST(m_is_clone_of) &&
+      unlikely((error=
                 m_part_info->set_partition_bitmaps(m_partitions_to_open))))
     goto err_alloc;
 
@@ -4034,9 +4035,14 @@ THR_LOCK_DATA **ha_partition::store_lock(THD *thd,
   }
   else
   {
-    for (i= bitmap_get_first_set(&(m_part_info->lock_partitions));
+    MY_BITMAP *used_partitions= lock_type == TL_UNLOCK ||
+                                lock_type == TL_IGNORE ?
+                                &m_locked_partitions :
+                                &m_part_info->lock_partitions;
+
+    for (i= bitmap_get_first_set(used_partitions);
          i < m_tot_parts;
-         i= bitmap_get_next_set(&m_part_info->lock_partitions, i))
+         i= bitmap_get_next_set(used_partitions, i))
     {
       DBUG_PRINT("info", ("store lock %u iteration", i));
       to= m_file[i]->store_lock(thd, to, lock_type);
@@ -5275,7 +5281,7 @@ bool ha_partition::init_record_priority_queue()
     /* Initialize priority queue, initialized to reading forward. */
     int (*cmp_func)(void *, uchar *, uchar *);
     void *cmp_arg= (void*) this;
-    if (!m_using_extended_keys && !(table_flags() & HA_CMP_REF_IS_EXPENSIVE))
+    if (!m_using_extended_keys && !(table_flags() & HA_SLOW_CMP_REF))
       cmp_func= cmp_key_rowid_part_id;
     else
       cmp_func= cmp_key_part_id;

@@ -44,7 +44,6 @@
 #include "sql_cte.h"
 #include "ha_sequence.h"
 #include "sql_show.h"
-#include <atomic>
 
 /* For MySQL 5.7 virtual fields */
 #define MYSQL57_GENERATED_FIELD 128
@@ -70,8 +69,6 @@ LEX_CSTRING GENERAL_LOG_NAME= {STRING_WITH_LEN("general_log")};
 LEX_CSTRING SLOW_LOG_NAME= {STRING_WITH_LEN("slow_log")};
 
 LEX_CSTRING TRANSACTION_REG_NAME= {STRING_WITH_LEN("transaction_registry")};
-LEX_CSTRING MYSQL_USER_NAME= {STRING_WITH_LEN("user")};
-LEX_CSTRING MYSQL_DB_NAME= {STRING_WITH_LEN("db")};
 LEX_CSTRING MYSQL_PROC_NAME= {STRING_WITH_LEN("proc")};
 
 /* 
@@ -1078,7 +1075,7 @@ bool parse_vcol_defs(THD *thd, MEM_ROOT *mem_root, TABLE *table,
   while (pos < end)
   {
     uint type, expr_length;
-    if (table->s->mysql_version >= 100202)
+    if (table->s->frm_version >= FRM_VER_EXPRESSSIONS)
     {
       uint field_nr, name_length;
       /* see pack_expression() for how data is stored */
@@ -2311,7 +2308,7 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
             uint pk_part_length= key_first_info->key_part[i].store_length;
             if (keyinfo->ext_key_part_map & 1<<i)
             {
-              if (ext_key_length + pk_part_length > MAX_KEY_LENGTH)
+              if (ext_key_length + pk_part_length > MAX_DATA_LENGTH_FOR_KEY)
               {
                 add_keyparts_for_this_key= i;
                 break;
@@ -2321,9 +2318,9 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
           }
         }
 
-        if (add_keyparts_for_this_key < (keyinfo->ext_key_parts -
-                                        keyinfo->user_defined_key_parts))
-	{
+        if (add_keyparts_for_this_key < keyinfo->ext_key_parts -
+                                        keyinfo->user_defined_key_parts)
+        {
           share->ext_key_parts-= keyinfo->ext_key_parts;
           key_part_map ext_key_part_map= keyinfo->ext_key_part_map;
           keyinfo->ext_key_parts= keyinfo->user_defined_key_parts;
@@ -2474,7 +2471,7 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
         if (!(key_part->key_part_flag & (HA_BLOB_PART | HA_VAR_LENGTH_PART |
                                          HA_BIT_PART)) &&
             key_part->type != HA_KEYTYPE_FLOAT &&
-            key_part->type == HA_KEYTYPE_DOUBLE)
+            key_part->type != HA_KEYTYPE_DOUBLE)
           key_part->key_part_flag|= HA_CAN_MEMCMP;
       }
       keyinfo->usable_key_parts= usable_parts; // Filesort
@@ -3170,6 +3167,7 @@ enum open_frm_error open_table_from_share(THD *thd, TABLE_SHARE *share,
   uchar *record, *bitmaps;
   Field **field_ptr;
   uint8 save_context_analysis_only= thd->lex->context_analysis_only;
+  TABLE_SHARE::enum_v_keys check_set_initialized= share->check_set_initialized;
   DBUG_ENTER("open_table_from_share");
   DBUG_PRINT("enter",("name: '%s.%s'  form: %p", share->db.str,
                       share->table_name.str, outparam));
@@ -3288,6 +3286,8 @@ enum open_frm_error open_table_from_share(THD *thd, TABLE_SHARE *share,
       goto err;
   }
   (*field_ptr)= 0;                              // End marker
+
+  DEBUG_SYNC(thd, "TABLE_after_field_clone");
 
   outparam->vers_write= share->versioned;
 
@@ -3537,6 +3537,16 @@ partititon_err:
   }
 
   outparam->mark_columns_used_by_virtual_fields();
+  if (!check_set_initialized &&
+      share->check_set_initialized == TABLE_SHARE::V_KEYS)
+  {
+    // copy PART_INDIRECT_KEY_FLAG that was set meanwhile by *some* thread
+    for (uint i= 0 ; i < share->fields ; i++)
+    {
+      if (share->field[i]->flags & PART_INDIRECT_KEY_FLAG)
+        outparam->field[i]->flags|= PART_INDIRECT_KEY_FLAG;
+    }
+  }
 
   if (db_stat)
   {
@@ -3548,6 +3558,8 @@ partititon_err:
       share->no_replicate= TRUE;
     if (outparam->file->table_cache_type() & HA_CACHE_TBL_NOCACHE)
       share->not_usable_by_query_cache= TRUE;
+    if (outparam->file->ha_table_flags() & HA_CAN_ONLINE_BACKUPS)
+      share->online_backup= 1;
   }
 
   if (share->no_replicate || !binlog_filter->db_ok(share->db.str))
@@ -3945,6 +3957,7 @@ void update_create_info_from_table(HA_CREATE_INFO *create_info, TABLE *table)
   create_info->table_options= share->db_create_options;
   create_info->avg_row_length= share->avg_row_length;
   create_info->row_type= share->row_type;
+  create_info->key_block_size= share->key_block_size;
   create_info->default_table_charset= share->table_charset;
   create_info->table_charset= 0;
   create_info->comment= share->comment;
@@ -6856,6 +6869,7 @@ void TABLE::mark_columns_used_by_virtual_fields(void)
 {
   MY_BITMAP *save_read_set;
   Field **vfield_ptr;
+  TABLE_SHARE::enum_v_keys v_keys= TABLE_SHARE::NO_V_KEYS;
 
   /* If there is virtual fields are already initialized */
   if (s->check_set_initialized)
@@ -6896,12 +6910,12 @@ void TABLE::mark_columns_used_by_virtual_fields(void)
       if (bitmap_is_set(&tmp_set, i))
       {
         s->field[i]->flags|= PART_INDIRECT_KEY_FLAG;
-        field[i]->flags|= PART_INDIRECT_KEY_FLAG;
+        v_keys= TABLE_SHARE::V_KEYS;
       }
     }
     bitmap_clear_all(&tmp_set);
   }
-  s->check_set_initialized= 1;
+  s->check_set_initialized= v_keys;
   if (s->tmp_table == NO_TMP_TABLE)
     mysql_mutex_unlock(&s->LOCK_share);
 }

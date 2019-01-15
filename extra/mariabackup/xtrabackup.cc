@@ -36,8 +36,8 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
+this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 *******************************************************/
 
@@ -200,6 +200,8 @@ static char*	log_ignored_opt;
 
 extern my_bool opt_use_ssl;
 my_bool opt_ssl_verify_server_cert;
+my_bool opt_extended_validation;
+my_bool opt_backup_encrypted;
 
 /* === metadata of backup === */
 #define XTRABACKUP_METADATA_FILENAME "xtrabackup_checkpoints"
@@ -301,6 +303,7 @@ my_bool opt_decompress = FALSE;
 my_bool opt_remove_original;
 
 my_bool opt_lock_ddl_per_table = FALSE;
+static my_bool opt_check_privileges;
 
 extern const char *innodb_checksum_algorithm_names[];
 extern TYPELIB innodb_checksum_algorithm_typelib;
@@ -474,9 +477,18 @@ DECLARE_THREAD(dbug_execute_in_new_connection)(void *arg)
 	dbug_thread_param_t *par= (dbug_thread_param_t *)arg;
 	int err = mysql_query(par->con, par->query);
 	int err_no = mysql_errno(par->con);
-	DBUG_ASSERT(par->expect_err == err);
-	if (err && par->expect_errno)
-		DBUG_ASSERT(err_no == par->expect_errno);
+	if(par->expect_err != err)
+	{
+		msg("FATAL: dbug_execute_in_new_connection : mysql_query '%s' returns %d, instead of expected %d",
+			par->query, err, par->expect_err);
+		_exit(1);
+	}
+	if (err && par->expect_errno && par->expect_errno != err_no)
+	{
+		msg("FATAL: dbug_execute_in_new_connection: mysql_query '%s' returns mysql_errno %d, instead of expected %d",
+			par->query, err_no, par->expect_errno);
+		_exit(1);
+	}
 	mysql_close(par->con);
 	mysql_thread_end();
 	os_event_t done = par->done_event;
@@ -749,6 +761,8 @@ enum options_xtrabackup
   OPT_XTRA_DATABASES,
   OPT_XTRA_DATABASES_FILE,
   OPT_XTRA_PARALLEL,
+  OPT_XTRA_EXTENDED_VALIDATION,
+  OPT_XTRA_BACKUP_ENCRYPTED,
   OPT_XTRA_STREAM,
   OPT_XTRA_COMPRESS,
   OPT_XTRA_COMPRESS_THREADS,
@@ -822,7 +836,8 @@ enum options_xtrabackup
   OPT_PROTOCOL,
   OPT_LOCK_DDL_PER_TABLE,
   OPT_ROCKSDB_DATADIR,
-  OPT_BACKUP_ROCKSDB
+  OPT_BACKUP_ROCKSDB,
+  OPT_XTRA_CHECK_PRIVILEGES
 };
 
 struct my_option xb_client_options[] =
@@ -1205,6 +1220,22 @@ struct my_option xb_server_options[] =
    (G_PTR*) &xtrabackup_parallel, (G_PTR*) &xtrabackup_parallel, 0, GET_INT,
    REQUIRED_ARG, 1, 1, INT_MAX, 0, 0, 0},
 
+  {"extended_validation", OPT_XTRA_EXTENDED_VALIDATION,
+   "Enable extended validation for Innodb data pages during backup phase. "
+   "Will slow down backup considerably, in case encryption is used. "
+   "May fail if tables are created during the backup.",
+   (G_PTR*)&opt_extended_validation,
+   (G_PTR*)&opt_extended_validation,
+   0, GET_BOOL, NO_ARG, FALSE, 0, 0, 0, 0, 0},
+
+  {"backup_encrypted", OPT_XTRA_BACKUP_ENCRYPTED,
+   "In --backup, assume that nonzero key_version implies that the page"
+   " is encrypted. Use --backup --skip-backup-encrypted to allow"
+   " copying unencrypted that were originally created before MySQL 5.1.48.",
+   (G_PTR*)&opt_backup_encrypted,
+   (G_PTR*)&opt_backup_encrypted,
+   0, GET_BOOL, NO_ARG, TRUE, 0, 0, 0, 0, 0},
+
    {"log", OPT_LOG, "Ignored option for MySQL option compatibility",
    (G_PTR*) &log_ignored_opt, (G_PTR*) &log_ignored_opt, 0,
    GET_STR, OPT_ARG, 0, 0, 0, 0, 0, 0},
@@ -1375,6 +1406,10 @@ struct my_option xb_server_options[] =
    &xb_backup_rocksdb, &xb_backup_rocksdb,
    0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0 },
 
+   {"check-privileges", OPT_XTRA_CHECK_PRIVILEGES, "Check database user "
+   "privileges fro the backup user",
+   &opt_check_privileges, &opt_check_privileges,
+   0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0 },
 
   { 0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
@@ -1437,7 +1472,7 @@ debug_sync_point(const char *name)
 }
 
 
-static std::vector<std::string> tables_for_export;
+static std::set<std::string> tables_for_export;
 
 static void append_export_table(const char *dbname, const char *tablename, bool is_remote)
 {
@@ -1449,7 +1484,15 @@ static void append_export_table(const char *dbname, const char *tablename, bool 
     char *p=strrchr(buf, '.');
     if (p) *p=0;
 
-    tables_for_export.push_back(ut_get_name(0,buf));
+    std::string name=ut_get_name(0, buf);
+    /* Strip partition name comment from table name, if any */
+    if (ends_with(name.c_str(), "*/"))
+    {
+      size_t pos= name.rfind("/*");
+      if (pos != std::string::npos)
+         name.resize(pos);
+    }
+    tables_for_export.insert(name);
   }
 }
 
@@ -1464,9 +1507,10 @@ static int create_bootstrap_file()
 
   fputs("SET NAMES UTF8;\n",f);
   enumerate_ibd_files(append_export_table);
-  for (size_t i= 0; i < tables_for_export.size(); i++)
+  for (std::set<std::string>::iterator it = tables_for_export.begin();
+       it != tables_for_export.end(); it++)
   {
-     const char *tab = tables_for_export[i].c_str();
+     const char *tab = it->c_str();
      fprintf(f,
      "BEGIN NOT ATOMIC "
        "DECLARE CONTINUE HANDLER FOR NOT FOUND,SQLEXCEPTION BEGIN END;"
@@ -1496,7 +1540,7 @@ static int prepare_export()
     snprintf(cmdline, sizeof cmdline,
      IF_WIN("\"","") "\"%s\" --mysqld \"%s\" "
       " --defaults-extra-file=./backup-my.cnf --defaults-group-suffix=%s --datadir=."
-      " --innodb --innodb-fast-shutdown=0"
+      " --innodb --innodb-fast-shutdown=0 --loose-partition"
       " --innodb_purge_rseg_truncate_frequency=1 --innodb-buffer-pool-size=%llu"
       " --console  --skip-log-error --bootstrap  < "  BOOTSTRAP_FILENAME IF_WIN("\"",""),
       mariabackup_exe, 
@@ -1508,7 +1552,7 @@ static int prepare_export()
     sprintf(cmdline,
      IF_WIN("\"","") "\"%s\" --mysqld"
       " --defaults-file=./backup-my.cnf --defaults-group-suffix=%s --datadir=."
-      " --innodb --innodb-fast-shutdown=0"
+      " --innodb --innodb-fast-shutdown=0 --loose-partition"
       " --innodb_purge_rseg_truncate_frequency=1 --innodb-buffer-pool-size=%llu"
       " --console  --log-error= --bootstrap  < "  BOOTSTRAP_FILENAME IF_WIN("\"",""),
       mariabackup_exe,
@@ -2348,6 +2392,18 @@ check_if_skip_table(
 	const char *ptr;
 	char *eptr;
 
+
+	dbname = NULL;
+	tbname = name;
+	while ((ptr = strchr(tbname, '/')) != NULL) {
+		dbname = tbname;
+		tbname = ptr + 1;
+	}
+
+	if (strncmp(tbname, tmp_file_prefix, tmp_file_prefix_length) == 0) {
+		return TRUE;
+	}
+
 	if (regex_exclude_list.empty() &&
 		regex_include_list.empty() &&
 		tables_include_hash == NULL &&
@@ -2355,13 +2411,6 @@ check_if_skip_table(
 		databases_include_hash == NULL &&
 		databases_exclude_hash == NULL) {
 		return(FALSE);
-	}
-
-	dbname = NULL;
-	tbname = name;
-	while ((ptr = strchr(tbname, '/')) != NULL) {
-		dbname = tbname;
-		tbname = ptr + 1;
 	}
 
 	if (dbname == NULL) {
@@ -3083,11 +3132,8 @@ xb_load_single_table_tablespace(
 
 		ut_a(space != NULL);
 
-		if (!fil_node_create(file->filepath(), ulint(n_pages), space,
-				     false, false)) {
-			ut_error;
-		}
-
+		space->add(file->filepath(), OS_FILE_CLOSED, ulint(n_pages),
+			   false, false);
 		/* by opening the tablespace we forcing node and space objects
 		in the cache to be populated with fields from space header */
 		space->open();
@@ -3342,8 +3388,15 @@ xb_load_tablespaces()
 		return(DB_ERROR);
 	}
 
-	err = srv_sys_space.open_or_create(false, false, &sum_of_new_sizes,
-					   &flush_lsn);
+	for (int i= 0; i < 10; i++) {
+		err = srv_sys_space.open_or_create(false, false, &sum_of_new_sizes,
+						 &flush_lsn);
+		if (err == DB_PAGE_CORRUPTED || err == DB_CORRUPTION) {
+			my_sleep(1000);
+		}
+		else
+		 break;
+	}
 
 	if (err != DB_SUCCESS) {
 		msg("mariabackup: Could not open data files.\n");
@@ -3764,21 +3817,16 @@ xb_filters_free()
 }
 
 /*********************************************************************//**
-Creates or opens the log files and closes them.
-@return	DB_SUCCESS or error code */
+Create log file metadata. */
 static
-ulint
+void
 open_or_create_log_file(
 /*====================*/
 	fil_space_t* space,
-	ibool*	log_file_created,	/*!< out: TRUE if new log file
-					created */
 	ulint	i)			/*!< in: log file number in group */
 {
 	char	name[10000];
 	ulint	dirnamelen;
-
-	*log_file_created = FALSE;
 
 	os_normalize_path(srv_log_group_home_dir);
 
@@ -3791,14 +3839,13 @@ open_or_create_log_file(
 		name[dirnamelen++] = OS_PATH_SEPARATOR;
 	}
 
-	sprintf(name + dirnamelen, "%s%lu", "ib_logfile", (ulong) i);
+	sprintf(name + dirnamelen, "%s%zu", "ib_logfile", i);
 
 	ut_a(fil_validate());
 
-	ut_a(fil_node_create(name, ulint(srv_log_file_size >> srv_page_size_shift),
-			     space, false, false));
-
-	return(DB_SUCCESS);
+	space->add(name, OS_FILE_CLOSED,
+		   ulint(srv_log_file_size >> srv_page_size_shift),
+		   false, false);
 }
 
 /***********************************************************************
@@ -4058,13 +4105,6 @@ fail:
 
 	xb_filters_init();
 
-	{
-	ibool	log_file_created;
-	ibool	log_created	= FALSE;
-	ibool	log_opened	= FALSE;
-	ulint	err;
-	ulint	i;
-
 	xb_fil_io_init();
 	srv_n_file_io_threads = srv_n_read_io_threads;
 
@@ -4077,36 +4117,8 @@ fail:
 		"innodb_redo_log", SRV_LOG_SPACE_FIRST_ID, 0,
 		FIL_TYPE_LOG, NULL);
 
-	for (i = 0; i < srv_n_log_files; i++) {
-		err = open_or_create_log_file(space, &log_file_created, i);
-		if (err != DB_SUCCESS) {
-			goto fail;
-		}
-
-		if (log_file_created) {
-			log_created = TRUE;
-		} else {
-			log_opened = TRUE;
-		}
-		if ((log_opened && log_created)) {
-			msg(
-	"mariabackup: Error: all log files must be created at the same time.\n"
-	"mariabackup: All log files must be created also in database creation.\n"
-	"mariabackup: If you want bigger or smaller log files, shut down the\n"
-	"mariabackup: database and make sure there were no errors in shutdown.\n"
-	"mariabackup: Then delete the existing log files. Edit the .cnf file\n"
-	"mariabackup: and start the database again.\n");
-
-			goto fail;
-		}
-	}
-
-	/* log_file_created must not be TRUE, if online */
-	if (log_file_created) {
-		msg("mariabackup: Something wrong with source files...\n");
-		goto fail;
-	}
-
+	for (ulint i = 0; i < srv_n_log_files; i++) {
+		open_or_create_log_file(space, i);
 	}
 
 	/* create extra LSN dir if it does not exist. */
@@ -4280,7 +4292,7 @@ fail_before_log_copying_thread_start:
 		DBUG_EXECUTE_IF("check_mdl_lock_works",
 			dbug_alter_thread_done =
 			dbug_start_query_thread("ALTER TABLE test.t ADD COLUMN mdl_lock_column int",
-				"Waiting for table metadata lock", 1, ER_QUERY_INTERRUPTED););
+				"Waiting for table metadata lock", 0, 0););
 	}
 
 	datafiles_iter_t *it = datafiles_iter_new();
@@ -4498,6 +4510,7 @@ void backup_fix_ddl(void)
 	}
 	datafiles_iter_free(it);
 
+	DBUG_EXECUTE_IF("check_mdl_lock_works", DBUG_ASSERT(new_tables.size() == 0););
 	for (std::set<std::string>::iterator iter = new_tables.begin();
 		iter != new_tables.end(); iter++) {
 		const char *space_name = iter->c_str();
@@ -5681,6 +5694,153 @@ append_defaults_group(const char *group, const char *default_groups[],
 	ut_a(appended);
 }
 
+static const char*
+normalize_privilege_target_name(const char* name)
+{
+	if (strcmp(name, "*") == 0) {
+		return "\\*";
+	}
+	else {
+		/* should have no regex special characters. */
+		ut_ad(strpbrk(name, ".()[]*+?") == 0);
+	}
+	return name;
+}
+
+/******************************************************************//**
+Check if specific privilege is granted.
+Uses regexp magic to check if requested privilege is granted for given
+database.table or database.* or *.*
+or if user has 'ALL PRIVILEGES' granted.
+@return true if requested privilege is granted, false otherwise. */
+static bool
+has_privilege(const std::list<std::string> &granted,
+	const char* required,
+	const char* db_name,
+	const char* table_name)
+{
+	char buffer[1000];
+	regex_t priv_re;
+	regmatch_t tables_regmatch[1];
+	bool result = false;
+
+	db_name = normalize_privilege_target_name(db_name);
+	table_name = normalize_privilege_target_name(table_name);
+
+	int written = snprintf(buffer, sizeof(buffer),
+		"GRANT .*(%s)|(ALL PRIVILEGES).* ON (\\*|`%s`)\\.(\\*|`%s`)",
+		required, db_name, table_name);
+	if (written < 0 || written == sizeof(buffer)
+		|| regcomp(&priv_re, buffer, REG_EXTENDED)) {
+		exit(EXIT_FAILURE);
+	}
+
+	typedef std::list<std::string>::const_iterator string_iter;
+	for (string_iter i = granted.begin(), e = granted.end(); i != e; ++i) {
+		int res = regexec(&priv_re, i->c_str(),
+			1, tables_regmatch, 0);
+
+		if (res != REG_NOMATCH) {
+			result = true;
+			break;
+		}
+	}
+
+	xb_regfree(&priv_re);
+	return result;
+}
+
+enum {
+	PRIVILEGE_OK = 0,
+	PRIVILEGE_WARNING = 1,
+	PRIVILEGE_ERROR = 2,
+};
+
+/******************************************************************//**
+Check if specific privilege is granted.
+Prints error message if required privilege is missing.
+@return PRIVILEGE_OK if requested privilege is granted, error otherwise. */
+static
+int check_privilege(
+	const std::list<std::string> &granted_priv, /* in: list of
+							granted privileges*/
+	const char* required,		/* in: required privilege name */
+	const char* target_database,	/* in: required privilege target
+						database name */
+	const char* target_table,	/* in: required privilege target
+						table name */
+	int error = PRIVILEGE_ERROR)	/* in: return value if privilege
+						is not granted */
+{
+	if (!has_privilege(granted_priv,
+		required, target_database, target_table)) {
+		msg("%s: missing required privilege %s on %s.%s\n",
+			(error == PRIVILEGE_ERROR ? "Error" : "Warning"),
+			required, target_database, target_table);
+		return error;
+	}
+	return PRIVILEGE_OK;
+}
+
+
+/**
+Check DB user privileges according to the intended actions.
+
+Fetches DB user privileges, determines intended actions based on
+command-line arguments and prints missing privileges.
+@return whether all the necessary privileges are granted */
+static bool check_all_privileges()
+{
+	if (!mysql_connection) {
+		/* Not connected, no queries is going to be executed. */
+		return true;
+	}
+
+	/* Fetch effective privileges. */
+	std::list<std::string> granted_privileges;
+	MYSQL_RES* result = xb_mysql_query(mysql_connection, "SHOW GRANTS",
+					   true);
+	while (MYSQL_ROW row = mysql_fetch_row(result)) {
+		granted_privileges.push_back(*row);
+	}
+	mysql_free_result(result);
+
+	int check_result = PRIVILEGE_OK;
+
+	/* FLUSH TABLES WITH READ LOCK */
+	if (!opt_no_lock)
+	{
+		check_result |= check_privilege(
+			granted_privileges,
+			"RELOAD", "*", "*");
+		check_result |= check_privilege(
+			granted_privileges,
+			"PROCESS", "*", "*");
+	}
+
+	/* KILL ... */
+	if ((!opt_no_lock && (opt_kill_long_queries_timeout || opt_lock_ddl_per_table))
+		/* START SLAVE SQL_THREAD */
+		/* STOP SLAVE SQL_THREAD */
+		|| opt_safe_slave_backup) {
+		check_result |= check_privilege(
+			granted_privileges,
+			"SUPER", "*", "*",
+			PRIVILEGE_WARNING);
+	}
+
+	/* SHOW MASTER STATUS */
+	/* SHOW SLAVE STATUS */
+	if (opt_galera_info || opt_slave_info
+		|| (opt_no_lock && opt_safe_slave_backup)) {
+		check_result |= check_privilege(granted_privileges,
+			"REPLICATION CLIENT", "*", "*",
+			PRIVILEGE_WARNING);
+	}
+
+	return !(check_result & PRIVILEGE_ERROR);
+}
+
 bool
 xb_init()
 {
@@ -5745,7 +5905,9 @@ xb_init()
 		if (!get_mysql_vars(mysql_connection)) {
 			return(false);
 		}
-
+		if (opt_check_privileges && !check_all_privileges()) {
+			return(false);
+		}
 		history_start_time = time(NULL);
 
 	}
@@ -6292,3 +6454,12 @@ static int get_exepath(char *buf, size_t size, const char *argv0)
 
   return my_realpath(buf, argv0, 0);
 }
+
+
+#if defined (__SANITIZE_ADDRESS__) && defined (__linux__)
+/* Avoid LeakSanitizer's false positives. */
+const char* __asan_default_options()
+{
+  return "detect_leaks=0";
+}
+#endif

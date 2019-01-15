@@ -34,11 +34,8 @@ Created 10/21/1995 Heikki Tuuri
 *******************************************************/
 
 #ifndef UNIV_INNOCHECKSUM
-
-#include "ha_prototypes.h"
-#include "sql_const.h"
-
 #include "os0file.h"
+#include "sql_const.h"
 
 #ifdef UNIV_LINUX
 #include <sys/types.h>
@@ -48,9 +45,6 @@ Created 10/21/1995 Heikki Tuuri
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "fil0fil.h"
-#include "fil0crypt.h"
-#include "fsp0fsp.h"
-#include "fil0pagecompress.h"
 #include "srv0srv.h"
 #ifdef HAVE_LINUX_UNISTD_H
 #include "unistd.h"
@@ -1090,22 +1084,8 @@ os_aio_validate_skip()
 /** Try os_aio_validate() every this many times */
 # define OS_AIO_VALIDATE_SKIP	13
 
-	/** The os_aio_validate() call skip counter.
-	Use a signed type because of the race condition below. */
-	static int os_aio_validate_count = OS_AIO_VALIDATE_SKIP;
-
-	/* There is a race condition below, but it does not matter,
-	because this call is only for heuristic purposes. We want to
-	reduce the call frequency of the costly os_aio_validate()
-	check in debug builds. */
-	--os_aio_validate_count;
-
-	if (os_aio_validate_count > 0) {
-		return(true);
-	}
-
-	os_aio_validate_count = OS_AIO_VALIDATE_SKIP;
-	return(os_aio_validate());
+	static Atomic_counter<uint32_t> os_aio_validate_count;
+	return (os_aio_validate_count++ % OS_AIO_VALIDATE_SKIP) || os_aio_validate();
 }
 #endif /* UNIV_DEBUG */
 

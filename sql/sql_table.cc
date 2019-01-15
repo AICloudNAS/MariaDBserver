@@ -33,7 +33,6 @@
                                                 // partition_info
                                                 // NOT_A_PARTITION_ID
 #include "sql_db.h"                             // load_db_opt_by_name
-#include "sql_time.h"                  // make_truncated_value_warning
 #include "records.h"             // init_read_record, end_read_record
 #include "filesort.h"            // filesort_free_buffers
 #include "sql_select.h"                // setup_order
@@ -2041,18 +2040,6 @@ bool mysql_rm_table(THD *thd,TABLE_LIST *tables, bool if_exists,
 
   if (!drop_temporary)
   {
-    if (!in_bootstrap)
-    {
-      for (table= tables; table; table= table->next_local)
-      {
-        LEX_CSTRING db_name= table->db;
-        LEX_CSTRING table_name= table->table_name;
-        if (table->open_type == OT_BASE_ONLY ||
-            !thd->find_temporary_table(table))
-          (void) delete_statistics_for_table(thd, &db_name, &table_name);
-      }
-    }
-
     if (!thd->locked_tables_mode)
     {
       if (drop_sequence)
@@ -2116,6 +2103,18 @@ bool mysql_rm_table(THD *thd,TABLE_LIST *tables, bool if_exists,
         }
       }
     }
+    /* We remove statistics for table last, after we have the DDL lock */
+    if (!in_bootstrap)
+    {
+      for (table= tables; table; table= table->next_local)
+      {
+        LEX_CSTRING db_name= table->db;
+        LEX_CSTRING table_name= table->table_name;
+        if (table->open_type == OT_BASE_ONLY ||
+            !thd->find_temporary_table(table))
+          (void) delete_statistics_for_table(thd, &db_name, &table_name);
+      }
+    }
   }
 
   /* mark for close and remove all cached entries */
@@ -2128,7 +2127,6 @@ bool mysql_rm_table(THD *thd,TABLE_LIST *tables, bool if_exists,
     DBUG_RETURN(TRUE);
   my_ok(thd);
   DBUG_RETURN(FALSE);
-
 }
 
 
@@ -2935,20 +2933,6 @@ uint Column_definition::pack_flag_numeric(uint dec) const
 
 bool Column_definition::prepare_stage2_varchar(ulonglong table_flags)
 {
-#ifndef QQ_ALL_HANDLERS_SUPPORT_VARCHAR
-  if (table_flags & HA_NO_VARCHAR)
-  {
-    /* convert VARCHAR to CHAR because handler is not yet up to date */
-    set_handler(&type_handler_var_string);
-    pack_length= type_handler()->calc_pack_length((uint) length);
-    if ((length / charset->mbmaxlen) > MAX_FIELD_CHARLENGTH)
-    {
-      my_error(ER_TOO_BIG_FIELDLENGTH, MYF(0), field_name.str,
-               static_cast<ulong>(MAX_FIELD_CHARLENGTH));
-      return true;
-    }
-  }
-#endif
   pack_flag= (charset->state & MY_CS_BINSORT) ? FIELDFLAG_BINARY : 0;
   return false;
 }
@@ -4147,7 +4131,7 @@ mysql_prepare_create_table(THD *thd, HA_CREATE_INFO *create_info,
     key_info++;
   }
 
-  if (!unique_key && !primary_key &&
+  if (!unique_key && !primary_key && !create_info->sequence &&
       (file->ha_table_flags() & HA_REQUIRE_PRIMARY_KEY))
   {
     my_message(ER_REQUIRES_PRIMARY_KEY, ER_THD(thd, ER_REQUIRES_PRIMARY_KEY),
@@ -5558,12 +5542,7 @@ bool mysql_create_like_table(THD* thd, TABLE_LIST* table,
     properly isolated from all concurrent operations which matter.
   */
 
-  /* Copy temporarily the statement flags to thd for lock_table_names() */
-  // QQ: is this really needed???
-  uint save_thd_create_info_options= thd->lex->create_info.options;
-  thd->lex->create_info.options|= create_info->options;
-  res= open_tables(thd, &thd->lex->query_tables, &not_used, 0);
-  thd->lex->create_info.options= save_thd_create_info_options;
+  res= open_tables(thd, *create_info, &thd->lex->query_tables, &not_used, 0);
 
   if (res)
   {
@@ -7411,12 +7390,10 @@ static bool mysql_inplace_alter_table(THD *thd,
   bool reopen_tables= false;
   bool res;
 
-  /*
-    Set the truncated column values of thd as warning
-    for alter table.
-  */
-  thd->count_cuted_fields = CHECK_FIELD_WARN;
   DBUG_ENTER("mysql_inplace_alter_table");
+
+  /* Downgrade DDL lock while we are waiting for exclusive lock below */
+  backup_set_alter_copy_lock(thd, table);
 
   /*
     Upgrade to EXCLUSIVE lock if:
@@ -7490,9 +7467,7 @@ static bool mysql_inplace_alter_table(THD *thd,
       thd->mdl_context.upgrade_shared_lock(table->mdl_ticket,
                                            MDL_SHARED_NO_WRITE,
                                            thd->variables.lock_wait_timeout))
-  {
     goto cleanup;
-  }
 
   // It's now safe to take the table level lock.
   if (lock_tables(thd, table_list, alter_ctx->tables_opened, 0))
@@ -7529,9 +7504,7 @@ static bool mysql_inplace_alter_table(THD *thd,
 
   if (table->file->ha_prepare_inplace_alter_table(altered_table,
                                                   ha_alter_info))
-  {
     goto rollback;
-  }
 
   /*
     Downgrade the lock if storage engine has told us that exclusive lock was
@@ -7571,6 +7544,10 @@ static bool mysql_inplace_alter_table(THD *thd,
 
   // Upgrade to EXCLUSIVE before commit.
   if (wait_while_table_is_used(thd, table, HA_EXTRA_PREPARE_FOR_RENAME))
+    goto rollback;
+
+  /* Set MDL_BACKUP_DDL */
+  if (backup_reset_alter_copy_lock(thd))
     goto rollback;
 
   /*
@@ -7632,7 +7609,7 @@ static bool mysql_inplace_alter_table(THD *thd,
     Rename to the new name (if needed) will be handled separately below.
 
     TODO: remove this check of thd->is_error() (now it intercept
-    errors in some val_*() methoids and bring some single place to
+    errors in some val_*() methods and bring some single place to
     such error interception).
   */
   if (mysql_rename_table(db_type, &alter_ctx->new_db, &alter_ctx->tmp_name,
@@ -9104,6 +9081,7 @@ bool mysql_alter_table(THD *thd, const LEX_CSTRING *new_db,
   uint tables_opened;
 
   thd->open_options|= HA_OPEN_FOR_ALTER;
+  thd->mdl_backup_ticket= 0;
   bool error= open_tables(thd, &table_list, &tables_opened, 0,
                           &alter_prelocking_strategy);
   thd->open_options&= ~HA_OPEN_FOR_ALTER;
@@ -9211,12 +9189,12 @@ bool mysql_alter_table(THD *thd, const LEX_CSTRING *new_db,
       }
 
       /*
-        Global intention exclusive lock must have been already acquired when
-        table to be altered was open, so there is no need to do it here.
+        Protection against global read lock must have been acquired when table
+        to be altered was being opened.
       */
-      DBUG_ASSERT(thd->mdl_context.is_lock_owner(MDL_key::GLOBAL,
+      DBUG_ASSERT(thd->mdl_context.is_lock_owner(MDL_key::BACKUP,
                                                  "", "",
-                                                 MDL_INTENTION_EXCLUSIVE));
+                                                 MDL_BACKUP_DDL));
 
       if (thd->mdl_context.acquire_locks(&mdl_requests,
                                          thd->variables.lock_wait_timeout))
@@ -9701,9 +9679,16 @@ bool mysql_alter_table(THD *thd, const LEX_CSTRING *new_db,
     if (use_inplace)
     {
       table->s->frm_image= &frm;
+      enum_check_fields save_count_cuted_fields= thd->count_cuted_fields;
+      /*
+        Set the truncated column values of thd as warning
+        for alter table.
+      */
+      thd->count_cuted_fields = CHECK_FIELD_WARN;
       int res= mysql_inplace_alter_table(thd, table_list, table, altered_table,
                                          &ha_alter_info, inplace_supported,
                                          &target_mdl_request, &alter_ctx);
+      thd->count_cuted_fields= save_count_cuted_fields;
       my_free(const_cast<uchar*>(frm.str));
 
       if (res)
@@ -10090,16 +10075,6 @@ end_temporary:
 
 err_new_table_cleanup:
   my_free(const_cast<uchar*>(frm.str));
-  if (new_table)
-  {
-    thd->drop_temporary_table(new_table, NULL, true);
-  }
-  else
-    (void) quick_rm_table(thd, new_db_type,
-                          &alter_ctx.new_db, &alter_ctx.tmp_name,
-                          (FN_IS_TMP | (no_ha_table ? NO_HA_TABLE : 0)),
-                          alter_ctx.get_tmp_path());
-
   /*
     No default value was provided for a DATE/DATETIME field, the
     current sql_mode doesn't allow the '0000-00-00' value and
@@ -10129,10 +10104,21 @@ err_new_table_cleanup:
     thd->abort_on_warning= true;
     thd->push_warning_truncated_value_for_field(Sql_condition::WARN_LEVEL_WARN,
                                                 f_type, f_val,
+                                                new_table->s,
                                                 alter_ctx.datetime_field->
                                                 field_name.str);
     thd->abort_on_warning= save_abort_on_warning;
   }
+
+  if (new_table)
+  {
+    thd->drop_temporary_table(new_table, NULL, true);
+  }
+  else
+    (void) quick_rm_table(thd, new_db_type,
+                          &alter_ctx.new_db, &alter_ctx.tmp_name,
+                          (FN_IS_TMP | (no_ha_table ? NO_HA_TABLE : 0)),
+                          alter_ctx.get_tmp_path());
 
   DBUG_RETURN(true);
 
@@ -10256,6 +10242,8 @@ copy_data_between_tables(THD *thd, TABLE *from, TABLE *to,
     delete [] copy;
     DBUG_RETURN(-1);
   }
+
+  backup_set_alter_copy_lock(thd, from);
 
   alter_table_manage_keys(to, from->file->indexes_are_disabled(), keys_onoff);
 
@@ -10410,14 +10398,7 @@ copy_data_between_tables(THD *thd, TABLE *from, TABLE *to,
       error= 1;
       break;
     }
-    if (to->next_number_field)
-    {
-      if (auto_increment_field_copied)
-        to->auto_increment_field_not_null= TRUE;
-      else
-        to->next_number_field->reset();
-    }
-    
+
     for (Copy_field *copy_ptr=copy ; copy_ptr != copy_end ; copy_ptr++)
     {
       copy_ptr->do_copy(copy_ptr);
@@ -10455,6 +10436,13 @@ copy_data_between_tables(THD *thd, TABLE *from, TABLE *to,
     if (keep_versioned && to->versioned(VERS_TRX_ID))
       to->vers_write= false;
 
+    if (to->next_number_field)
+    {
+      if (auto_increment_field_copied)
+        to->auto_increment_field_not_null= TRUE;
+      else
+        to->next_number_field->reset();
+    }
     error= to->file->ha_write_row(to->record[0]);
     to->auto_increment_field_not_null= FALSE;
     if (unlikely(error))
@@ -10538,6 +10526,9 @@ copy_data_between_tables(THD *thd, TABLE *from, TABLE *to,
   cleanup_done= 1;
   to->file->extra(HA_EXTRA_NO_IGNORE_DUP_KEY);
 
+  if (backup_reset_alter_copy_lock(thd))
+    error= 1;
+
   if (unlikely(mysql_trans_commit_alter_copy_data(thd)))
     error= 1;
 
@@ -10556,7 +10547,7 @@ copy_data_between_tables(THD *thd, TABLE *from, TABLE *to,
 
   if (!cleanup_done)
   {
-    /* This happens if we get an error during initialzation of data */
+    /* This happens if we get an error during initialization of data */
     DBUG_ASSERT(error);
     to->file->ha_end_bulk_insert();
     ha_enable_transaction(thd, TRUE);
